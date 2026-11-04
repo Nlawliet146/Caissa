@@ -1,6 +1,8 @@
 #include "search.hpp"
 #include "movegen.hpp"
 #include "evaluate.hpp"
+#include "tt.hpp"
+#include "py_bridge.hpp"
 #include <algorithm>
 
 int quiescence(Board& board, int alpha, int beta) {
@@ -12,7 +14,7 @@ int quiescence(Board& board, int alpha, int beta) {
     generate_pseudo_legal_moves(board, move_list);
 
     for (const auto& move : move_list) {
-        if (move.flags != 1) continue; // Only process captures
+        if (move.flags != 1) continue; // Tactical Captures only
         if (!board.make_move(move)) continue;
         int score = -quiescence(board, -beta, -alpha);
         board.unmake_move(move);
@@ -23,22 +25,59 @@ int quiescence(Board& board, int alpha, int beta) {
     return alpha;
 }
 
-int alpha_beta(Board& board, int depth, int alpha, int beta) {
+void score_moves(const Board& board, std::vector<Move>& move_list, const Move& tt_move, const std::vector<float>& ml_priors) {
+    for (auto& move : move_list) {
+        if (move.from_sq == tt_move.from_sq && move.to_sq == tt_move.to_sq) {
+            move.score = 100000; // #1 Priority: TT Hit
+        } else if (move.flags == 1) { // Capture
+            move.score = 50000 + (board.square_board[move.to_sq] * 10) - board.square_board[move.from_sq]; // MVV-LVA
+        } else {
+            // #2 Priority: Python ML ResNet Priors
+            move.score = (int)(ml_priors[move.from_sq * 64 + move.to_sq] * 1000.0f);
+        }
+    }
+    // Descending sort
+    std::sort(move_list.begin(), move_list.end(), [](const Move& a, const Move& b) {
+        return a.score > b.score;
+    });
+}
+
+int alpha_beta(Board& board, int depth, int alpha, int beta, const std::vector<float>& ml_priors) {
+    int original_alpha = alpha;
+    uint64_t hash = generate_hash(board);
+    Move tt_move = {NO_SQ, NO_SQ, EMPTY, 0, 0};
+    int cached_score;
+
+    if (tt_probe(hash, depth, alpha, beta, cached_score, tt_move)) {
+        return cached_score;
+    }
+
     if (depth == 0) return quiescence(board, alpha, beta);
 
     std::vector<Move> move_list;
     generate_pseudo_legal_moves(board, move_list);
+    score_moves(board, move_list, tt_move, ml_priors);
 
     int legal_moves = 0;
+    Move best_move = {NO_SQ, NO_SQ, EMPTY, 0, 0};
+
     for (const auto& move : move_list) {
         if (!board.make_move(move)) continue;
         legal_moves++;
 
-        int score = -alpha_beta(board, depth - 1, -beta, -alpha);
+        // Decrease depth and recursively call. Pass empty priors inside tree to avoid Python overhead.
+        static std::vector<float> empty_priors;
+        int score = -alpha_beta(board, depth - 1, -beta, -alpha, empty_priors);
         board.unmake_move(move);
 
-        if (score >= beta) return beta; // Beta cutoff
-        if (score > alpha) alpha = score;
+        if (score >= beta) {
+            tt_store(hash, depth, beta, HASH_BETA, move);
+            return beta; 
+        }
+        if (score > alpha) {
+            alpha = score;
+            best_move = move;
+        }
     }
 
     if (legal_moves == 0) {
@@ -49,24 +88,36 @@ int alpha_beta(Board& board, int depth, int alpha, int beta) {
         return 0; // Stalemate
     }
 
+    int flag = (alpha <= original_alpha) ? HASH_ALPHA : HASH_EXACT;
+    tt_store(hash, depth, alpha, flag, best_move);
     return alpha;
 }
 
 Move search_root(Board& board, int depth) {
+    // 1. Root Level Asynchronous Call to Python
+    std::string current_fen = board.to_fen();
+    std::vector<float> priors = PythonBridge::get_instance().get_priors(current_fen);
+
     std::vector<Move> move_list;
     generate_pseudo_legal_moves(board, move_list);
+    
+    Move empty_tt = {NO_SQ, NO_SQ, EMPTY, 0, 0};
+    score_moves(board, move_list, empty_tt, priors);
 
     Move best_move = move_list[0];
     int best_score = -50000;
 
-    for (const auto& move : move_list) {
-        if (!board.make_move(move)) continue;
-        int score = -alpha_beta(board, depth - 1, -50000, 50000);
-        board.unmake_move(move);
+    // Iterative Deepening
+    for (int d = 1; d <= depth; d++) {
+        for (const auto& move : move_list) {
+            if (!board.make_move(move)) continue;
+            int score = -alpha_beta(board, d - 1, -50000, 50000, priors);
+            board.unmake_move(move);
 
-        if (score > best_score) {
-            best_score = score;
-            best_move = move;
+            if (score > best_score) {
+                best_score = score;
+                best_move = move;
+            }
         }
     }
     return best_move;
