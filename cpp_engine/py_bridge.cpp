@@ -66,13 +66,21 @@ PythonBridge& PythonBridge::get_instance() {
 }
 
 std::vector<float> PythonBridge::get_priors(const std::string& fen) {
-    if (!initialized) return std::vector<float>(4096, 0.0f);
+    // Fallback zero vector if not initialized
+    if (!initialized) return std::vector<float>();
     
     try {
         py::object result = inference_func(fen);
+        
+        // Ensure Python actually returned a valid list or array, not None
+        if (result.is_none()) {
+            return std::vector<float>();
+        }
+        
         return result.cast<std::vector<float>>();
-    } catch (...) {
-        return std::vector<float>(4096, 0.0f);
+    } catch (const std::exception& e) {
+        std::cerr << "[PyBridge Error] Exception during inference: " << e.what() << "\n";
+        return std::vector<float>();
     }
 }
 

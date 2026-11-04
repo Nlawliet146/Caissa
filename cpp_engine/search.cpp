@@ -32,8 +32,13 @@ void score_moves(const Board& board, std::vector<Move>& move_list, const Move& t
         } else if (move.flags == 1) { // Capture
             move.score = 50000 + (board.square_board[move.to_sq] * 10) - board.square_board[move.from_sq]; // MVV-LVA
         } else {
-            // #2 Priority: Python ML ResNet Priors
-            move.score = (int)(ml_priors[move.from_sq * 64 + move.to_sq] * 1000.0f);
+            // #2 Priority: Python ML ResNet Priors (with safe bounds check)
+            size_t idx = move.from_sq * 64 + move.to_sq;
+            if (!ml_priors.empty() && idx < ml_priors.size()) {
+                move.score = (int)(ml_priors[idx] * 1000.0f);
+            } else {
+                move.score = 0; // Safe fallback so it never segfaults if model isn't loaded/trained
+            }
         }
     }
     // Descending sort
@@ -41,7 +46,6 @@ void score_moves(const Board& board, std::vector<Move>& move_list, const Move& t
         return a.score > b.score;
     });
 }
-
 int alpha_beta(Board& board, int depth, int alpha, int beta, const std::vector<float>& ml_priors) {
     int original_alpha = alpha;
     uint64_t hash = generate_hash(board);
