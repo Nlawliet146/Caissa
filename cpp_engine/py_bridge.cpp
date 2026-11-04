@@ -2,34 +2,54 @@
 #include <pybind11/embed.h>
 #include <pybind11/stl.h>
 #include <iostream>
-#include <filesystem>
+#include <unistd.h>
+#include <limits.h>
+#include <libgen.h>
 
 namespace py = pybind11;
-namespace fs = std::filesystem;
 
-// Locates python_ml by starting at the folder that contains the executable
-// and walking upward. Independent of the working directory (Linux).
-static std::string find_python_dir() {
-    std::error_code ec;
-    fs::path dir = fs::read_symlink("/proc/self/exe", ec).parent_path();
-    while (!ec && !dir.empty()) {
-        if (fs::is_directory(dir / "python_ml")) return (dir / "python_ml").string();
-        if (dir == dir.parent_path()) break;
-        dir = dir.parent_path();
-    }
-    return (fs::current_path() / "python_ml").string();   // last-resort fallback
-}
-
-// Global scoped interpreter ensures Python boots only once and stays alive
 static py::scoped_interpreter* guard = nullptr;
 static py::object inference_func;
+
+// Helper to get the absolute path of the directory where the binary is running, then find project root
+std::string get_project_root() {
+    char result[PATH_MAX];
+    ssize_t count = readlink("/proc/self/exe", result, PATH_MAX);
+    if (count != -1) {
+        std::string path(result, count);
+        // path is something like /path/to/Caissa/build/caissa
+        // We need to go up twice: out of 'build/' to reach the project root
+        char* dir1 = dirname(&path[0]);
+        // Note: dirname modifies in-place, so let's use a safer approach or standard string manipulation:
+    }
+    
+    // Fallback/Standard C++ string manipulation based on current working directory or executable path
+    char cwd[PATH_MAX];
+    if (getcwd(cwd, sizeof(cwd)) != NULL) {
+        std::string current(cwd);
+        // If run from build/ folder, project root is parent directory
+        if (current.find("build") != std::string::npos) {
+            // Find last occurrence of build and truncate
+            size_t pos = current.rfind("build");
+            if (pos != std::string::npos) {
+                return current.substr(0, pos);
+            }
+        }
+        return current + "/";
+    }
+    return "./";
+}
 
 PythonBridge::PythonBridge() {
     try {
         if (!guard) guard = new py::scoped_interpreter{};
         py::module_ sys = py::module_::import("sys");
-        // Point Python to Pratham's ML directory
-        sys.attr("path").attr("insert")(0, find_python_dir());
+        
+        // Dynamically locate the project root and add python_ml to Python's search path
+        std::string root = get_project_root();
+        std::string ml_path = root + "python_ml";
+        
+        sys.attr("path").attr("append")(ml_path);
         
         py::module_ pipeline = py::module_::import("inference_pipeline");
         inference_func = pipeline.attr("get_search_priors");
@@ -46,7 +66,6 @@ PythonBridge& PythonBridge::get_instance() {
 }
 
 std::vector<float> PythonBridge::get_priors(const std::string& fen) {
-    // Graceful fallback if ML isn't ready
     if (!initialized) return std::vector<float>(4096, 0.0f);
     
     try {
