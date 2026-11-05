@@ -2,5 +2,8 @@ build/
 .cache/
 compile_commands.json
 .vscode/
-build/
-build/
+venv/
+.venv/
+data/
+__pycache__/
+*.pyc

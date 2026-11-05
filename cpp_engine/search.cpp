@@ -98,29 +98,47 @@ int alpha_beta(Board& board, int depth, int alpha, int beta, const std::vector<f
 }
 
 Move search_root(Board& board, int depth) {
-    // 1. Root Level Asynchronous Call to Python
-    std::string current_fen = board.to_fen();
-    std::vector<float> priors = PythonBridge::get_instance().get_priors(current_fen);
+    // Ask Python ONCE, for the root position only.
+    std::vector<float> priors = PythonBridge::get_instance().get_priors(board.to_fen());
 
     std::vector<Move> move_list;
     generate_pseudo_legal_moves(board, move_list);
-    
+    if (move_list.empty()) return {NO_SQ, NO_SQ, EMPTY, 0, 0};
+
     Move empty_tt = {NO_SQ, NO_SQ, EMPTY, 0, 0};
-    score_moves(board, move_list, empty_tt, priors);
+    score_moves(board, move_list, empty_tt, priors);   // captures + ML decide the first order
+
+    // The priors describe the ROOT position only, so deeper nodes must not use them.
+    static const std::vector<float> no_priors;
 
     Move best_move = move_list[0];
-    int best_score = -50000;
 
-    // Iterative Deepening
     for (int d = 1; d <= depth; d++) {
+        int alpha = -50000;
+        const int beta = 50000;
+        bool found = false;
+        Move iter_best = best_move;
+
         for (const auto& move : move_list) {
             if (!board.make_move(move)) continue;
-            int score = -alpha_beta(board, d - 1, -50000, 50000, priors);
+            int score = -alpha_beta(board, d - 1, -beta, -alpha, no_priors);
             board.unmake_move(move);
 
-            if (score > best_score) {
-                best_score = score;
-                best_move = move;
+            if (!found || score > alpha) {   // a better move raises alpha, so later moves get pruned harder
+                found = true;
+                alpha = score;
+                iter_best = move;
+            }
+        }
+        if (!found) break;
+        best_move = iter_best;
+
+        // Next, deeper iteration: try the best move found so far FIRST.
+        for (auto it = move_list.begin(); it != move_list.end(); ++it) {
+            if (it->from_sq == best_move.from_sq && it->to_sq == best_move.to_sq &&
+                it->promoted_piece == best_move.promoted_piece) {
+                std::rotate(move_list.begin(), it, it + 1);
+                break;
             }
         }
     }
