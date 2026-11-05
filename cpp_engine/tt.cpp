@@ -1,9 +1,14 @@
 #include "tt.hpp"
 #include <random>
+#include <cstring>
 
 TTEntry TranspositionTable[TT_SIZE];
 uint64_t ZobristPieces[12][64];
 uint64_t ZobristSide;
+
+void clear_tt() {
+    memset(TranspositionTable, 0, TT_SIZE * sizeof(TTEntry));
+}
 
 void init_zobrist() {
     std::mt19937_64 rng(1337); // Seeded PRNG for reproducible hashes

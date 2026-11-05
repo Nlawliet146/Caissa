@@ -1,76 +1,107 @@
 #include "uci.hpp"
-#include "board.hpp"
 #include "search.hpp"
-#include "movegen.hpp"
 #include "tt.hpp"
+#include "board.hpp"
 #include <iostream>
-#include <string>
 #include <sstream>
+#include <string>
+#include <thread>
 
-std::string move_to_string(const Move& m) {
-    std::string s = "";
-    s += (char)('a' + (m.from_sq % 8));
-    s += (char)('1' + (m.from_sq / 8));
-    s += (char)('a' + (m.to_sq % 8));
-    s += (char)('1' + (m.to_sq / 8));
-    if (m.promoted_piece == W_QUEEN || m.promoted_piece == B_QUEEN) s += "q";
-    if (m.promoted_piece == W_ROOK || m.promoted_piece == B_ROOK) s += "r";
-    if (m.promoted_piece == W_BISHOP || m.promoted_piece == B_BISHOP) s += "b";
-    if (m.promoted_piece == W_KNIGHT || m.promoted_piece == B_KNIGHT) s += "n";
-    return s;
+std::atomic<bool> stop_search(false);
+bool use_ml = true; // Default to ML on
+
+void parse_go(const std::string& command, Board& board) {
+    SearchLimits limits;
+    std::istringstream iss(command);
+    std::string token;
+    iss >> token; // skip "go"
+
+    while (iss >> token) {
+        if (token == "wtime") iss >> limits.wtime;
+        else if (token == "btime") iss >> limits.btime;
+        else if (token == "winc") iss >> limits.winc;
+        else if (token == "binc") iss >> limits.binc;
+        else if (token == "depth") iss >> limits.depth;
+        else if (token == "movetime") iss >> limits.movetime;
+    }
+
+    // Reset the stop flag before starting
+    stop_search = false;
+
+    // Start search in a separate thread so the UCI loop can continue listening for "stop"
+    std::thread search_thread(iterative_deepening, std::ref(board), limits);
+    search_thread.detach(); 
 }
 
-Move parse_move(Board& board, const std::string& move_str) {
-    std::vector<Move> moves;
-    generate_pseudo_legal_moves(board, moves);
-    for (const auto& m : moves) {
-        if (move_to_string(m) == move_str && board.make_move(m)) {
-            board.unmake_move(m);
-            return m;
+void parse_position(const std::string& command, Board& board) {
+    std::istringstream iss(command);
+    std::string token;
+    iss >> token; // skip "position"
+    iss >> token;
+
+    if (token == "startpos") {
+        // CALL YOUR STARTING BOARD SETUP HERE
+        // Example: board.parse_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
+        
+        iss >> token; // consume "moves" if it exists in the string
+    } 
+    else if (token == "fen") {
+        std::string fen;
+        while (iss >> token && token != "moves") {
+            fen += token + " ";
         }
+        // CALL YOUR FEN PARSER HERE
+        // Example: board.parse_fen(fen);
     }
-    return {NO_SQ, NO_SQ, EMPTY, 0, 0};
+
+    // Parse and execute the list of moves that follow the starting position
+    while (iss >> token) {
+        // CALL YOUR MOVE PARSER/EXECUTOR HERE
+        // Example: board.make_move(token);
+    }
 }
 
 void uci_loop() {
+    std::string line;
     Board board;
-    board.parse_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-    init_zobrist();
-    std::string line, token;
 
     while (std::getline(std::cin, line)) {
-        std::istringstream is(line);
-        is >> token;
+        std::istringstream iss(line);
+        std::string token;
+        iss >> token;
 
         if (token == "uci") {
             std::cout << "id name Caissa\n";
-            std::cout << "id author Naman & Pratham\n";
-            std::cout << "uciok\n";
-        } else if (token == "isready") {
-            std::cout << "readyok\n";
-        } else if (token == "position") {
-            is >> token;
-            if (token == "startpos") {
-                board.parse_fen("rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQkq - 0 1");
-                is >> token;
-            } else if (token == "fen") {
-                std::string fen;
-                while (is >> token && token != "moves") fen += token + " ";
-                board.parse_fen(fen);
-            }
-            if (token == "moves") {
-                std::string move_str;
-                while (is >> move_str) {
-                    Move m = parse_move(board, move_str);
-                    board.make_move(m);
+            std::cout << "id author nlawliet\n";
+            std::cout << "option name UseML type check default true\n";
+            std::cout << "uciok\n" << std::flush;
+        } 
+        else if (token == "isready") {
+            std::cout << "readyok\n" << std::flush;
+        } 
+        else if (token == "ucinewgame") {
+            clear_tt(); // Calling the standalone function we fixed in tt.cpp
+        } 
+        else if (token == "setoption") {
+            if (line.find("UseML") != std::string::npos) {
+                if (line.find("false") != std::string::npos) {
+                    use_ml = false;
+                } else if (line.find("true") != std::string::npos) {
+                    use_ml = true;
                 }
             }
-        } else if (token == "go") {
-            int depth = 5; // Default search depth
-            // Here you can parse "wtime", "btime" etc. if needed later
-            Move best = search_root(board, depth);
-            std::cout << "bestmove " << move_to_string(best) << "\n";
-        } else if (token == "quit") {
+        } 
+        else if (token == "position") {
+            parse_position(line, board);
+        } 
+        else if (token == "go") {
+            parse_go(line, board);
+        } 
+        else if (token == "stop") {
+            stop_search = true;
+        } 
+        else if (token == "quit") {
+            stop_search = true;
             break;
         }
     }

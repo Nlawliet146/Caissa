@@ -21,5 +21,5 @@ void init_zobrist();
 uint64_t generate_hash(const Board& board);
 void tt_store(uint64_t key, int depth, int score, int flag, Move best_move);
 bool tt_probe(uint64_t key, int depth, int alpha, int beta, int& return_score, Move& return_move);
-
+void clear_tt();
 #endif
