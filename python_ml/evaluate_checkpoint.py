@@ -5,6 +5,7 @@ from pathlib import Path
 import numpy as np
 import torch
 
+from checkpoint import load_policy
 from dataset import PositionStore
 from move_ordering_model import MoveOrderingNet
 from train_move_ordering import evaluate
@@ -27,10 +28,14 @@ def main():
     if not len(indices):
         parser.error("the dataset has no validation positions")
     model = MoveOrderingNet()
-    model.load_state_dict(torch.load(args.weights, map_location="cpu", weights_only=True))
+    weights, policy_format = load_policy(args.weights)
+    if policy_format != store.policy_format:
+        parser.error("checkpoint and dataset use different board encodings")
+    model.load_state_dict(weights)
     loss, top1, top5 = evaluate(model, store, indices, args.batch_size, "cpu")
     print(f"Validation: {len(indices):,} positions from {len(np.unique(store.game[indices])):,} games")
-    print(f"Unmasked cross-entropy: {loss:.4f} | top-1: {top1:.2%} | top-5: {top5:.2%}")
+    mode = "Legal-masked" if policy_format else "Unmasked"
+    print(f"{mode} cross-entropy: {loss:.4f} | top-1: {top1:.2%} | top-5: {top5:.2%}")
 
 
 if __name__ == "__main__":

@@ -102,26 +102,40 @@ TimeBudget compute_time_budget(const SearchLimits& lim, int side) {
 // ---------------------------------------------------------------------------
 namespace {
 
-int quiescence(Board& board, int alpha, int beta, SearchState& ss) {
+int quiescence(Board& board, int alpha, int beta, int ply, SearchState& ss) {
     if (must_stop(ss)) return 0;
 
-    int stand_pat = evaluate(board);
-    if (stand_pat >= beta) return beta;
-    if (alpha < stand_pat) alpha = stand_pat;
+    const bool checked = in_check(board);
+    if (board.is_fifty_move_draw()) {
+        return checked && !has_legal_move(board) ? -MATE_SCORE + ply : 0;
+    }
+    if (ply >= MAX_PLY) return evaluate(board);
+
+    // A checked side must move. Its static evaluation is not a lower bound.
+    if (!checked) {
+        const int stand_pat = evaluate(board);
+        if (stand_pat >= beta) return beta;
+        if (alpha < stand_pat) alpha = stand_pat;
+    }
 
     std::vector<Move> move_list;
     generate_pseudo_legal_moves(board, move_list);
 
+    bool found_legal_move = false;
     for (const auto& move : move_list) {
-        if (move.flags != 1) continue; // Tactical Captures only
+        const bool tactical = move.flags == 1 || move.flags == 2 || move.promoted_piece != EMPTY;
+        if (!checked && !tactical) continue;
         if (!board.make_move(move)) continue;
-        int score = -quiescence(board, -beta, -alpha, ss);
+        found_legal_move = true;
+        const int score = board.is_repetition(ss.root_hist)
+            ? 0 : -quiescence(board, -beta, -alpha, ply + 1, ss);
         board.unmake_move(move);
         if (stop_search.load()) return 0;
 
         if (score >= beta) return beta;
         if (score > alpha) alpha = score;
     }
+    if (checked && !found_legal_move) return -MATE_SCORE + ply;
     return alpha;
 }
 
@@ -171,7 +185,7 @@ int alpha_beta(Board& board, int depth, int alpha, int beta, int ply,
         return cached_score;
     }
 
-    if (depth <= 0) return quiescence(board, alpha, beta, ss);
+    if (depth <= 0) return quiescence(board, alpha, beta, ply, ss);
 
     std::vector<Move> move_list;
     generate_pseudo_legal_moves(board, move_list);

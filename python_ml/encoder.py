@@ -1,15 +1,34 @@
 import chess
 import numpy as np
 
+# Each square uses six bits. XOR 56 flips its rank and preserves its file.
+MIRRORED_MOVE = (56 << 6) | 56
+POLICY_FORMAT = "side_to_move_v1"
+
+
+def move_index(move, mirrored=False):
+    index = move.from_square * 64 + move.to_square
+    return index ^ MIRRORED_MOVE if mirrored else index
+
+
+def mirror_position(board):
+    mirrored = board.copy(stack=False)
+    mirrored.apply_mirror()
+    return mirrored
+
+
 def fen_to_tensor(fen):
+    return board_to_tensor(chess.Board(fen))
+
+
+def board_to_tensor(board):
     """
-    Converts a FEN string to a (14, 8, 8) spatial PyTorch tensor.
+    Converts a board to a (14, 8, 8) NumPy array.
     Channels 0-5: White P,N,B,R,Q,K
     Channels 6-11: Black p,n,b,r,q,k
     Channel 12: Active Color (1 for White, 0 for Black)
     Channel 13: Castling rights
     """
-    board = chess.Board(fen)
     tensor = np.zeros((14, 8, 8), dtype=np.float32)
     
     # Piece mappings

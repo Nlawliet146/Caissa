@@ -24,6 +24,8 @@ import chess
 import numpy as np
 import torch
 
+from encoder import POLICY_FORMAT
+
 _SHIFTS = torch.arange(64, dtype=torch.int64)
 
 
@@ -68,6 +70,29 @@ class PositionStore:
         self.meta = np.load(os.path.join(folder, "meta.npy"))
         self.move = np.load(os.path.join(folder, "move.npy"))
         self.game = np.load(os.path.join(folder, "game.npy"))
+
+        legal_path = os.path.join(folder, "legal.npy")
+        offsets_path = os.path.join(folder, "legal_offsets.npy")
+        has_legal = os.path.exists(legal_path)
+        if has_legal != os.path.exists(offsets_path):
+            raise ValueError("Incomplete Phase 5 dataset. Prepare it again in a fresh directory.")
+        self.policy_format = POLICY_FORMAT if has_legal else None
+        if has_legal:
+            self.legal = np.load(legal_path, mmap_mode="r")
+            self.legal_offsets = np.load(offsets_path)
+            if len(self.legal_offsets) != len(self) + 1 or self.legal_offsets[-1] != len(self.legal):
+                raise ValueError("Legal labels do not match the dataset")
+
+    def legal_mask(self, idx):
+        if self.policy_format is None:
+            return None
+        mask = np.zeros((len(idx), 4096), dtype=np.bool_)
+        for row, position in enumerate(idx):
+            start, end = self.legal_offsets[position:position + 2]
+            mask[row, self.legal[start:end]] = True
+        if not mask[np.arange(len(idx)), self.move[idx]].all():
+            raise ValueError("A recorded move is missing from its legal mask")
+        return torch.from_numpy(mask)
 
     def __len__(self):
         return len(self.move)

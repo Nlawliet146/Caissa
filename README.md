@@ -1,69 +1,70 @@
 # Caissa
-chess engine, that will be using machine learning (probably)
 
-## Phase 3 measurements
+Caissa is a chess engine built as a B.Tech capstone project. It combines
+classical chess search with a neural network that predicts moves people are
+likely to play. The project asks whether those predictions help a search
+find better moves within the same time budget.
 
-Build `build/caissa` against the same Python minor version as the environment
-containing `requirements.txt`. Caissa embeds Python, so pass that environment's
-site-packages path to the binary as well as using its interpreter for the
-scripts. From the repository root, with the project environment active:
+The C++ engine represents the board with bitboards, generates legal moves,
+and searches possible replies using iterative deepening and alpha-beta
+pruning. A Python model supplies move priorities through pybind11. Caissa
+tries the prioritized moves earlier, then chooses its move using the search
+score. A UCI-compatible chess GUI can send positions and display the
+engine's chosen move. Personalized opponent modeling is future work.
+
+## Build and run
+
+On Linux, install a C++17 compiler, CMake, and Python with matching
+development headers and virtual environment support. From the repository root:
 
 ```sh
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install -r requirements.txt
+cmake -S . -B build -DPython3_EXECUTABLE="$VIRTUAL_ENV/bin/python" \
+  -Dpybind11_DIR="$(python -m pybind11 --cmakedir)"
+cmake --build build -j
 export PYTHONPATH="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')${PYTHONPATH:+:$PYTHONPATH}"
-python benchmark.py --json build/phase3-benchmark.json
-python python_ml/evaluate_checkpoint.py
-python match.py --output build/phase3-baseline.pgn
+./build/caissa
 ```
 
-- **Benchmark.** Identical FENs in both modes, with alternating run order,
-  a reset transposition table before each search, and model startup outside
-  the timed region. The fixed-depth comparison measures work to reach the
-  same depth. The fixed-time comparison measures depth reached under the same
-  budget. UCI nodes and engine time are from the last completed iteration.
-  Wall time measures from sending `go` through receiving `bestmove` and also
-  includes any unfinished iteration. The engine reserves 30 ms from each
-  `movetime` for overhead.
-- **Validation.** Requires the four `.npy` arrays in `data/processed` from
-  the checkpoint's training corpus. The script reuses the trainer's
-  `game_id % 20 == 0` selection, capped at 50,000 positions. This partition
-  was used for checkpoint selection. The checkpoint stores weights only, so
-  a matching dataset must be supplied separately. Top-k measures whether
-  the human move's from/to label is among the k highest-scoring output
-  labels before applying the inference-time legal mask.
-- **Match.** Requires Cute Chess CLI 1.5.1. The default uses 50 distinct
-  EPD openings, each played with both color assignments, one game at a time.
-  Each move has a 60 ms limit with a 30 ms engine reserve. Games still
-  ongoing at the 100-full-move cap are adjudicated as draws. The fixture
-  comes from the first 50 distinct positions after eight plies in the local
-  November 2025 Lichess Elite archive, skipping invalid games and games
-  shorter than 16 plies. An alternate suite can be supplied with `--openings`.
-  The runner keeps the PGN and its sibling UCI log, checks the color-swapped
-  pairs and ML diagnostics, and reports wins, draws, losses, and termination
-  reasons. Choose a fresh output path for each run.
+The shipped checkpoint is loaded automatically when ML is enabled. In a chess
+GUI, launch the engine with the same environment. Set `UseML` to `false` in
+the GUI or start the engine with `CAISSA_ML=0` for classical ordering.
 
-The ML score is `(wins + draws / 2) / games`. The two games in a pair share
-an opening, so uncertainty about the score should be estimated using opening
-pairs as the sampling units.
+For a terminal demo, enter these commands in the running engine. Wait for
+`readyok` before sending the position.
 
-## Phase 4 experiments
+```text
+uci
+isready
+position startpos
+go depth 4
+```
 
-Both experiments default to off and require `UseML=true`.
+The engine prints search depth, score, nodes and time, then returns
+`bestmove`. To compare classical ordering, send
+`setoption name UseML value false`, then `ucinewgame`, and repeat the same
+position and search. Send `quit` to exit.
 
-- `MLRootLMR` searches eligible late, low-prior root moves one ply shallower
-  and re-searches at full depth when the reduced probe beats alpha.
-- `MLPlyOne` also uses the policy to order opponent replies. A search caches
-  each ply-one position's priors across iterative deepening and checks the
-  deadline before and after each inference. A Python call already in progress
-  can finish past the deadline.
-
-With the environment set up as in Phase 3:
+## Tests and measurement
 
 ```sh
-python benchmark.py --experiment MLRootLMR --json build/phase4-lmr.json
-python benchmark.py --experiment MLPlyOne --json build/phase4-ply-one.json
-python match.py --root-lmr --output build/phase4-lmr.pgn
+python tests/uci_smoke.py ./build/caissa
+python benchmark.py --json build/benchmark.json
+python match.py --output build/match.pgn
 ```
 
-Each command compares one experiment against root ordering with ML enabled
-on both sides. The benchmark records reductions, full re-searches, ply-one
-calls, usable ply-one priors, and total ply-one inference time in microseconds.
+- **`tests/uci_smoke.py`** checks the UCI protocol, legal move generation,
+  search limits, and the bridge to Python.
+- **`benchmark.py`** runs the same positions with ML on and off. It compares
+  nodes and time at equal depth, and depth reached at equal time. It answers
+  whether the model changes the amount of search work or the depth reached.
+- **`match.py`** uses Cute Chess CLI 1.5.1 to play both versions against each
+  other under the same time control. It swaps colors for each opening and
+  records wins, draws, and losses in a PGN and log. It measures playing
+  strength under the chosen settings. Choose a fresh output path for each run.
+
+Training is optional. The scripts in `python_ml/` prepare PGN data, train
+checkpoints, and evaluate them. The shipped weights are enough to run the
+engine and the demo.

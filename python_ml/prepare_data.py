@@ -12,6 +12,7 @@ Accepts plain .pgn, .pgn.zst (Lichess dumps) and .zip files.
 Press Ctrl+C at any time: what has been collected so far is still saved.
 """
 import argparse
+from array import array
 import io
 import os
 import re
@@ -23,6 +24,7 @@ import chess.pgn
 import numpy as np
 
 from dataset import board_to_record
+from encoder import mirror_position, move_index
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -82,7 +84,7 @@ def wanted(text: str, min_elo: int) -> bool:
     return True
 
 
-def save(out_dir, chunks):
+def save(out_dir, chunks, phase5):
     os.makedirs(out_dir, exist_ok=True)
     if not chunks:
         raise SystemExit("No positions collected - check the file path and --min-elo.")
@@ -94,17 +96,32 @@ def save(out_dir, chunks):
     np.save(os.path.join(out_dir, "meta.npy"), meta)
     np.save(os.path.join(out_dir, "move.npy"), move)
     np.save(os.path.join(out_dir, "game.npy"), game)
+    if phase5:
+        np.save(os.path.join(out_dir, "legal.npy"), np.concatenate([c[4] for c in chunks]))
+        counts = np.concatenate([c[5] for c in chunks])
+        offsets = np.empty(len(counts) + 1, dtype=np.int64)
+        offsets[0] = 0
+        np.cumsum(counts, out=offsets[1:])
+        np.save(os.path.join(out_dir, "legal_offsets.npy"), offsets)
     print(f"Saved {len(move):,} positions from {int(game.max()) + 1:,} games -> {out_dir}")
 
 
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--pgn", required=True, help="path to .pgn / .pgn.zst / .zip")
-    ap.add_argument("--out", default=os.path.join(ROOT, "data", "processed"))
+    ap.add_argument("--out", help="output directory (must be new for --phase5)")
+    ap.add_argument("--phase5", action="store_true", help="normalize perspective and save legal labels")
     ap.add_argument("--min-elo", type=int, default=2000, help="BOTH players must be at least this")
     ap.add_argument("--max-games", type=int, default=20000, help="stop after this many accepted games")
     args = ap.parse_args()
 
+    if args.max_games <= 0:
+        ap.error("--max-games must be positive")
+    if args.out is None:
+        args.out = os.path.join(ROOT, "data", "phase5" if args.phase5 else "processed")
+    if os.path.exists(args.out) and (args.phase5 or os.path.exists(os.path.join(args.out, "legal_offsets.npy"))):
+        ap.error("choose a fresh output directory for Phase 5 data")
+    legal, counts = array("H"), array("H")
     chunks, bb_l, meta_l, move_l, game_l = [], [], [], [], []
 
     def flush():
@@ -114,8 +131,15 @@ def main():
                 np.array(meta_l, dtype=np.uint8),
                 np.array(move_l, dtype=np.uint16),
                 np.array(game_l, dtype=np.uint32),
+                np.array(legal, dtype=np.uint16),
+                np.array(counts, dtype=np.uint16),
             ))
-            bb_l.clear(); meta_l.clear(); move_l.clear(); game_l.clear()
+            bb_l.clear()
+            meta_l.clear()
+            move_l.clear()
+            game_l.clear()
+            del legal[:]
+            del counts[:]
 
     accepted, seen, start = 0, 0, time.time()
     try:
@@ -130,10 +154,15 @@ def main():
                 board = game.board()
                 n_before = len(move_l)
                 for move in game.mainline_moves():
-                    bbs, meta = board_to_record(board)
+                    mirrored = args.phase5 and board.turn == chess.BLACK
+                    bbs, meta = board_to_record(mirror_position(board) if mirrored else board)
+                    if args.phase5:
+                        labels = {move_index(candidate, mirrored) for candidate in board.legal_moves}
+                        legal.extend(sorted(labels))
+                        counts.append(len(labels))
                     bb_l.extend(bbs)
                     meta_l.append(meta)
-                    move_l.append(move.from_square * 64 + move.to_square)
+                    move_l.append(move_index(move, mirrored))
                     game_l.append(accepted)
                     board.push(move)
                 if len(move_l) == n_before:
@@ -149,7 +178,7 @@ def main():
     except KeyboardInterrupt:
         print("\nStopped by you - saving what we have so far...")
     flush()
-    save(args.out, chunks)
+    save(args.out, chunks, args.phase5)
 
 
 if __name__ == "__main__":

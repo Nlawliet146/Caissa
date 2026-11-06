@@ -168,8 +168,13 @@ check(bestmove(lines) == "0000", "stalemate -> bestmove 0000", str(lines[-1:]))
 
 print("== finds a mate in one")
 e.send("position fen 6k1/5ppp/8/8/8/8/8/R5K1 w - - 0 1")
-lines, _ = go(e, "go depth 3")
-check(bestmove(lines) == "a1a8", "back-rank mate a1a8", str(lines[-1:]))
+lines, _ = go(e, "go depth 1")
+check(bestmove(lines) == "a1a8" and any("score mate 1 " in line for line in lines),
+      "depth 1 recognizes back-rank mate a1a8 at the search horizon", str(lines[-3:]))
+e.send("position fen 4k3/8/8/8/8/8/8/R5K1 w - - 0 1")
+lines, _ = go(e, "go depth 1")
+check(any("score cp " in line for line in lines) and not any("score mate " in line for line in lines),
+      "a check with a quiet king escape is scored as a playable position", str(lines[-3:]))
 
 print("== ML switch")
 e.send("setoption name UseML value true")
