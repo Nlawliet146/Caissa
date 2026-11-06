@@ -13,14 +13,14 @@ ML = "Caissa-ML"
 BASE = "Caissa-NoML"
 
 
-def report(pgn, expected_games):
+def report(pgn, expected_games, baseline=BASE):
     results = Counter()
     openings = Counter()
     with pgn.open(encoding="utf-8") as handle:
         while (game := chess.pgn.read_game(handle)) is not None:
             white, black = game.headers["White"], game.headers["Black"]
             result = game.headers["Result"]
-            if game.errors or {white, black} != {ML, BASE}:
+            if game.errors or {white, black} != {ML, baseline}:
                 raise RuntimeError("Invalid match PGN")
             openings[game.board().epd(), white] += 1
             if result == "1/2-1/2":
@@ -35,7 +35,7 @@ def report(pgn, expected_games):
     if games != expected_games:
         raise RuntimeError(f"Expected {expected_games} games, got {games}")
     if len(openings) != games or any(
-        count != 1 or openings[position, BASE if white == ML else ML] != 1
+        count != 1 or openings[position, baseline if white == ML else ML] != 1
         for (position, white), count in openings.items()
     ):
         raise RuntimeError("Expected each opening exactly twice with colors swapped")
@@ -51,6 +51,7 @@ def main():
         help="EPD with distinct starting positions",
     )
     parser.add_argument("--output", type=Path, required=True, help="new PGN path")
+    parser.add_argument("--root-lmr", action="store_true", help="compare MLRootLMR against root ordering")
     parser.add_argument("--games", type=int, default=100)
     parser.add_argument("--seconds-per-move", type=float, default=0.06)
     parser.add_argument("--max-moves", type=int, default=100, help="adjudicate ongoing games as draws at this limit")
@@ -66,10 +67,13 @@ def main():
     with engine(args.engine, True, 60) as session:
         search(session, POSITIONS[0], "depth 1", True)
     binary = str(args.engine.resolve())
+    baseline = "Caissa-RootOrdering" if args.root_lmr else BASE
+    baseline_ml = str(args.root_lmr).lower()
+    variant_options = ["option.MLRootLMR=true"] if args.root_lmr else []
     command = [
         args.cutechess,
-        "-engine", f"name={ML}", f"cmd={binary}", "option.UseML=true",
-        "-engine", f"name={BASE}", f"cmd={binary}", "option.UseML=false",
+        "-engine", f"name={ML}", f"cmd={binary}", "option.UseML=true", *variant_options,
+        "-engine", f"name={baseline}", f"cmd={binary}", f"option.UseML={baseline_ml}",
         "-each", "proto=uci", "restart=off", f"st={args.seconds_per_move}", "option.MoveOverhead=30",
         "-debug", "all", "-games", "2", "-rounds", str(args.games // 2), "-repeat",
         "-openings", f"file={args.openings.resolve()}", "format=epd", "order=sequential",
@@ -80,14 +84,14 @@ def main():
         result = subprocess.run(command, env=engine_env(), stdout=log, stderr=subprocess.STDOUT)
     if result.returncode:
         raise RuntimeError(f"Cute Chess exited with status {result.returncode}; see {log_path}")
-    audit_log(log_path, args.games)
-    report(args.output, args.games)
+    audit_log(log_path, args.games, baseline, args.root_lmr)
+    report(args.output, args.games, baseline)
 
 
-def audit_log(path, expected_games):
+def audit_log(path, expected_games, baseline=BASE, root_lmr=False):
     searches = Counter()
     reasons = Counter()
-    traffic = re.compile(r"<(Caissa-ML|Caissa-NoML)\(\d+\): (.*)")
+    traffic = re.compile(rf"<({ML}|{re.escape(baseline)})\(\d+\): (.*)")
     with path.open(encoding="utf-8") as log:
         for line in log:
             if line.startswith("Finished game ") and "{" in line:
@@ -98,17 +102,30 @@ def audit_log(path, expected_games):
             player, message = match.groups()
             if message.startswith("bestmove "):
                 searches[player, "bestmove"] += 1
+            elif message.startswith("info string phase4 "):
+                if not root_lmr or player != ML:
+                    raise RuntimeError(f"Unexpected Phase 4 telemetry from {player}: {message}")
+                searches[player, "phase4"] += 1
+                fields = message.split()
+                searches[player, "reductions"] += int(fields[4])
+                searches[player, "researches"] += int(fields[6])
             elif message.startswith("info string ML "):
-                expected = "info string ML priors ok:" if player == ML else "info string ML off"
+                expected = "info string ML priors ok:" if player == ML or root_lmr else "info string ML off"
                 if not message.startswith(expected):
                     raise RuntimeError(f"Unexpected ML status from {player}: {message}")
                 searches[player, "status"] += 1
-    for player in (ML, BASE):
+    for player in (ML, baseline):
         if not searches[player, "status"] or searches[player, "status"] != searches[player, "bestmove"]:
             raise RuntimeError(f"Missing search diagnostics for {player}: {searches}")
     if sum(reasons.values()) != expected_games:
         raise RuntimeError(f"Missing game termination reasons in {path}")
-    print(f"Verified searches: ML {searches[ML, 'status']}, NoML {searches[BASE, 'status']}")
+    if root_lmr:
+        if searches[ML, "phase4"] != searches[ML, "status"]:
+            raise RuntimeError("Missing root LMR telemetry for one or more searches")
+        if not searches[ML, "reductions"]:
+            raise RuntimeError("No root reductions recorded in the match")
+        print(f"Root reductions: {searches[ML, 'reductions']}, full re-searches: {searches[ML, 'researches']}")
+    print(f"Verified searches: {ML} {searches[ML, 'status']}, {baseline} {searches[baseline, 'status']}")
     for reason, count in sorted(reasons.items()):
         print(f"  {count:3d} {reason}")
 

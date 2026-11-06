@@ -224,6 +224,23 @@ with tempfile.TemporaryDirectory() as tmp:
     check(any("ML priors ok" in l for l in lines), "ML found via CAISSA_ROOT regardless of cwd")
     e.quit()
 
+    # Both experiments obey UseML. Ply-one calls are cached across iterations.
+    e = fake({"FAKE_ML_DELAY": "0"})
+    e.send("setoption name MLRootLMR value true")
+    e.send("setoption name MLPlyOne value true")
+    e.send("position startpos")
+    lines, _ = go(e, "go depth 3")
+    stats = next((line.split() for line in lines if line.startswith("info string phase4 ")), [])
+    check(len(stats) == 13 and stats[4] == "0" and stats[8] == "20",
+          "20 ply-one calls across depth 2 and 3, no reductions below depth 4", str(stats))
+    n_before = len(open(os.path.join(tmp, "calls")).read().split())
+    e.send("setoption name UseML value false")
+    lines, _ = go(e, "go depth 3")
+    n_after = len(open(os.path.join(tmp, "calls")).read().split())
+    check(n_before == n_after and "info string ML off" in lines,
+          "UseML=false disables both Phase 4 experiments")
+    e.quit()
+
 try:
     import chess
     print("== cross-check 'position ... moves' + movegen against python-chess on random games")

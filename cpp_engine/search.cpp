@@ -9,6 +9,7 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -28,6 +29,10 @@ struct SearchState {
     TimePoint start{};
     int64_t   hard_ms = 0;   // 0 = no hard limit
     uint64_t  nodes   = 0;   // alpha_beta + quiescence nodes
+    bool ml_ply_one = false;
+    std::unordered_map<uint64_t, std::vector<float>> ply_one_priors;
+    int64_t ply_one_us = 0;
+    size_t ply_one_usable = 0;
     size_t    root_hist = 0; // board.history.size() at the root (repetition scope)
 };
 
@@ -50,13 +55,18 @@ bool in_check(const Board& board) {
     return is_square_attacked(board, __builtin_ctzll(kb), board.side_to_move ^ 1);
 }
 
+bool deadline_reached(const SearchState& ss) {
+    if (ss.hard_ms > 0 && elapsed_ms(ss.start) >= ss.hard_ms)
+        stop_search.store(true);
+    return stop_search.load();
+}
+
 // Counts one node and decides whether the search must unwind.
 // The clock is read only every 2048 nodes (a clock read costs ~20-30 ns,
 // a node ~0.5-1 us); the stop flag is read every node (a plain load).
 inline bool must_stop(SearchState& ss) {
     ss.nodes++;
-    if ((ss.nodes & 2047) == 0 && ss.hard_ms > 0 && elapsed_ms(ss.start) >= ss.hard_ms)
-        stop_search.store(true);
+    if ((ss.nodes & 2047) == 0) return deadline_reached(ss);
     return stop_search.load();
 }
 
@@ -139,7 +149,7 @@ void score_moves(const Board& board, std::vector<Move>& move_list, const Move& t
 }
 
 int alpha_beta(Board& board, int depth, int alpha, int beta, int ply,
-               const std::vector<float>& ml_priors, SearchState& ss) {
+               SearchState& ss) {
     if (must_stop(ss)) return 0; // Safe unwind
 
     // Draw detection (path-dependent: must precede the TT probe).
@@ -165,7 +175,25 @@ int alpha_beta(Board& board, int depth, int alpha, int beta, int ply,
 
     std::vector<Move> move_list;
     generate_pseudo_legal_moves(board, move_list);
-    score_moves(board, move_list, tt_move, ml_priors);
+    static const std::vector<float> no_priors;
+    const std::vector<float>* priors = &no_priors;
+    if (ply == 1 && ss.ml_ply_one) {
+        auto [entry, inserted] = ss.ply_one_priors.try_emplace(hash);
+        if (inserted) {
+            if (deadline_reached(ss)) {
+                ss.ply_one_priors.erase(entry);
+                return 0;
+            }
+            const auto start = get_time();
+            entry->second = PythonBridge::get_instance().get_priors(board.to_fen());
+            ss.ply_one_us += std::chrono::duration_cast<std::chrono::microseconds>(get_time() - start).count();
+            if (std::any_of(entry->second.begin(), entry->second.end(), [](float p) { return p > 0.0f; }))
+                ++ss.ply_one_usable;
+            if (deadline_reached(ss)) return 0;
+        }
+        priors = &entry->second;
+    }
+    score_moves(board, move_list, tt_move, *priors);
 
     int legal_moves = 0;
     Move best_move = {NO_SQ, NO_SQ, EMPTY, 0, 0};
@@ -174,9 +202,7 @@ int alpha_beta(Board& board, int depth, int alpha, int beta, int ply,
         if (!board.make_move(move)) continue;
         legal_moves++;
 
-        // Decrease depth and recursively call. Pass empty priors inside tree.
-        static const std::vector<float> empty_priors;
-        int score = -alpha_beta(board, depth - 1, -beta, -alpha, ply + 1, empty_priors, ss);
+        int score = -alpha_beta(board, depth - 1, -beta, -alpha, ply + 1, ss);
         board.unmake_move(move);
 
         // A child that was told to stop returns a dummy 0. That 0 is NOT a
@@ -238,15 +264,17 @@ void iterative_deepening(Board board, SearchLimits limits) {
         return;
     }
 
-    // 2. ML priors: ONE Python call at the root, only if enabled for this "go".
+    // Fetch root priors once per search.
     //    The time spent here is charged to the move clock (ss.start is the
     //    moment "go" arrived), so ML-vs-no-ML at equal time is an honest test.
     std::vector<float> priors;
+    bool has_priors = false;
     if (limits.use_ml) {
         const TimePoint t0 = get_time();
         priors = PythonBridge::get_instance().get_priors(board.to_fen());
         const auto nonzero = std::count_if(priors.begin(), priors.end(), [](float p) { return p > 0.0f; });
-        if (nonzero == 0) {
+        has_priors = nonzero > 0;
+        if (!has_priors) {
             // Never let "ML on" silently degrade into "ML off": say so.
             uci_print("info string ML requested but NO priors available (bridge/weights failed) - searching without ML");
         } else {
@@ -260,7 +288,11 @@ void iterative_deepening(Board board, SearchLimits limits) {
     Move empty_tt = {NO_SQ, NO_SQ, EMPTY, 0, 0};
     score_moves(board, root_moves, empty_tt, priors);
 
-    static const std::vector<float> no_priors;
+    ss.ml_ply_one = limits.ml_ply_one && has_priors;
+    const bool root_lmr = limits.ml_root_lmr && has_priors && !in_check(board);
+    const float uniform_prior = 1.0f / root_moves.size();
+    size_t reductions = 0;
+    size_t researches = 0;
     Move best_move_overall = root_moves[0]; // a legal fallback if "stop" arrives instantly
     int best_score_overall = 0;
     const int max_depth = (limits.depth > 0) ? std::min(limits.depth, MAX_DEPTH) : MAX_DEPTH;
@@ -273,9 +305,25 @@ void iterative_deepening(Board board, SearchLimits limits) {
         bool found = false;          // at least one root move FINISHED this iteration
         Move iter_best = best_move_overall;
 
-        for (const auto& move : root_moves) {
+        for (size_t i = 0; i < root_moves.size(); ++i) {
+            const Move& move = root_moves[i];
+            if ((root_lmr || ss.ml_ply_one) && deadline_reached(ss)) break;
             if (!board.make_move(move)) continue;
-            int score = -alpha_beta(board, d - 1, -beta, -alpha, 1, no_priors, ss);
+            const size_t prior_index = move.from_sq * 64 + move.to_sq;
+            const bool reduce = root_lmr && d >= 4 && i >= std::max<size_t>(3, root_moves.size() / 2) &&
+                                found && std::abs(alpha) < MATE_BOUND && move.flags == 0 &&
+                                move.promoted_piece == EMPTY && prior_index < priors.size() &&
+                                priors[prior_index] > 0 && priors[prior_index] < uniform_prior &&
+                                !in_check(board);
+            int score = alpha;
+            if (reduce) {
+                ++reductions;
+                score = -alpha_beta(board, d - 2, -alpha - 1, -alpha, 1, ss);
+            }
+            if (!stop_search.load() && (!reduce || score > alpha)) {
+                if (reduce) ++researches;
+                score = -alpha_beta(board, d - 1, -beta, -alpha, 1, ss);
+            }
             board.unmake_move(move);
 
             // Aborted mid-branch: this score is a dummy, discard it.
@@ -288,11 +336,8 @@ void iterative_deepening(Board board, SearchLimits limits) {
             }
         }
 
-        // Moves that completed before an abort carry exact scores under the
-        // full window, and the previous best move is searched first, so the
-        // best of them is never worse than the previous iteration's choice.
-        // Keeping it is sound; throwing away a half-done iteration is not
-        // needed.
+        // Keep a completed improvement or the fully searched first move.
+        // A reduced probe cannot become the best move without a full re-search.
         if (found) {
             best_move_overall = iter_best;
             best_score_overall = alpha;
@@ -341,5 +386,12 @@ void iterative_deepening(Board board, SearchLimits limits) {
         while (!stop_search.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
+    if (limits.ml_root_lmr || limits.ml_ply_one) {
+        uci_print("info string phase4 reductions " + std::to_string(reductions) +
+                  " researches " + std::to_string(researches) +
+                  " ply_one_calls " + std::to_string(ss.ply_one_priors.size()) +
+                  " ply_one_usable " + std::to_string(ss.ply_one_usable) +
+                  " ply_one_us " + std::to_string(ss.ply_one_us));
+    }
     uci_print("bestmove " + move_to_uci(best_move_overall));
 }

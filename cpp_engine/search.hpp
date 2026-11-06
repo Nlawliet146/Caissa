@@ -35,6 +35,8 @@ struct SearchLimits {
     // Snapshots taken on the UCI thread at the moment "go" is read, so one
     // search is internally consistent even if setoption arrives mid-search.
     bool use_ml      = true;
+    bool ml_root_lmr = false;
+    bool ml_ply_one  = false;
     int  overhead_ms = 30;
     TimePoint start{};    // the clock starts when the "go" line was READ
 };

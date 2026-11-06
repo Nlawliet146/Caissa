@@ -44,3 +44,26 @@ python match.py --output build/phase3-baseline.pgn
 The ML score is `(wins + draws / 2) / games`. The two games in a pair share
 an opening, so uncertainty about the score should be estimated using opening
 pairs as the sampling units.
+
+## Phase 4 experiments
+
+Both experiments default to off and require `UseML=true`.
+
+- `MLRootLMR` searches eligible late, low-prior root moves one ply shallower
+  and re-searches at full depth when the reduced probe beats alpha.
+- `MLPlyOne` also uses the policy to order opponent replies. A search caches
+  each ply-one position's priors across iterative deepening and checks the
+  deadline before and after each inference. A Python call already in progress
+  can finish past the deadline.
+
+With the environment set up as in Phase 3:
+
+```sh
+python benchmark.py --experiment MLRootLMR --json build/phase4-lmr.json
+python benchmark.py --experiment MLPlyOne --json build/phase4-ply-one.json
+python match.py --root-lmr --output build/phase4-lmr.pgn
+```
+
+Each command compares one experiment against root ordering with ML enabled
+on both sides. The benchmark records reductions, full re-searches, ply-one
+calls, usable ply-one priors, and total ply-one inference time in microseconds.

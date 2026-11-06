@@ -26,7 +26,7 @@ def engine_env():
 
 
 @contextmanager
-def engine(binary, use_ml, timeout):
+def engine(binary, use_ml, timeout, ml_option=None):
     with subprocess.Popen(
         [str(Path(binary).resolve())], env=engine_env(), text=True,
         stdin=subprocess.PIPE, stdout=subprocess.PIPE,
@@ -62,6 +62,8 @@ def engine(binary, use_ml, timeout):
             send("uci")
             until("uciok")
             send(f"setoption name UseML value {str(use_ml).lower()}")
+            if ml_option:
+                send(f"setoption name {ml_option} value true")
             send("isready")
             until("readyok")
             yield send, until
@@ -91,8 +93,10 @@ def search(session, fen, limit, use_ml):
         raise RuntimeError(f"Expected {expected!r}; got {lines}")
     iterations = [match for line in lines if (match := INFO.match(line))]
     depth, nodes, engine_ms = map(int, iterations[-1].groups()) if iterations else (0, None, None)
+    telemetry = next((line.split()[3:] for line in lines if line.startswith("info string phase4 ")), [])
+    stats = {key: int(value) for key, value in zip(telemetry[::2], telemetry[1::2])}
     return dict(depth=depth, nodes=nodes, engine_ms=engine_ms, wall_ms=wall_ms,
-                bestmove=lines[-1].split()[1])
+                bestmove=lines[-1].split()[1], **stats)
 
 
 def main():
@@ -102,23 +106,37 @@ def main():
     parser.add_argument("--movetime", type=int, default=200, help="milliseconds")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=60)
+    parser.add_argument("--experiment", choices=("MLRootLMR", "MLPlyOne"),
+                        help="compare one experiment against root ordering with ML enabled in both")
     parser.add_argument("--json", type=Path, help="write all individual measurements")
     args = parser.parse_args()
     if min(args.depth, args.movetime, args.repeats, args.timeout) <= 0:
         parser.error("limits, repeats and timeout must be positive")
     rows = []
-    with engine(args.engine, False, args.timeout) as off, engine(args.engine, True, args.timeout) as on:
+    control_ml = bool(args.experiment)
+    with (
+        engine(args.engine, control_ml, args.timeout) as control,
+        engine(args.engine, True, args.timeout, args.experiment) as treatment,
+    ):
         for limit in (f"depth {args.depth}", f"movetime {args.movetime}"):
             for repeat in range(args.repeats):
                 for index, fen in enumerate(POSITIONS):
-                    for use_ml in ([False, True] if (repeat + index) % 2 == 0 else [True, False]):
-                        result = search(on if use_ml else off, fen, limit, use_ml)
-                        rows.append(dict(limit=limit, fen=fen, repeat=repeat, ml=use_ml, **result))
+                    for variant in ([False, True] if (repeat + index) % 2 == 0 else [True, False]):
+                        result = search(treatment if variant else control, fen, limit, variant or control_ml)
+                        if args.experiment and variant and "reductions" not in result:
+                            raise RuntimeError(f"No Phase 4 telemetry for {args.experiment}")
+                        rows.append(dict(limit=limit, fen=fen, repeat=repeat, ml=variant or control_ml,
+                                         experiment=args.experiment if variant else None, **result))
             for use_ml in (False, True):
-                group = [row for row in rows if row["limit"] == limit and row["ml"] == use_ml]
-                print(f"{limit}, ML {'on' if use_ml else 'off'}, {len(group)} searches")
-                for field in ("depth", "nodes", "engine_ms", "wall_ms"):
-                    values = [row[field] for row in group if row[field] is not None]
+                group = [row for row in rows if row["limit"] == limit
+                         and (bool(row["experiment"]) if args.experiment else row["ml"]) == use_ml]
+                label = (args.experiment or "ML on") if use_ml else ("Root ordering" if control_ml else "ML off")
+                print(f"{limit}, {label}, {len(group)} searches")
+                for field in ("depth", "nodes", "engine_ms", "wall_ms", "reductions", "researches",
+                              "ply_one_calls", "ply_one_usable", "ply_one_us"):
+                    values = [row[field] for row in group if row.get(field) is not None]
+                    if not values and field not in ("depth", "nodes", "engine_ms", "wall_ms"):
+                        continue
                     value = f"{mean(values):.2f}" if values else "unavailable"
                     print(f"  mean {field}: {value} ({len(values)}/{len(group)} recorded)")
     if args.json:
