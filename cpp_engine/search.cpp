@@ -11,6 +11,7 @@
 #include <thread>
 #include <unordered_map>
 #include <vector>
+#include <bit>
 
 // ---------------------------------------------------------------------------
 // Shared flags (declared extern in search.hpp)
@@ -52,7 +53,7 @@ bool in_check(const Board& board) {
     const int king_p = (board.side_to_move == WHITE) ? W_KING : B_KING;
     const uint64_t kb = board.piece_bitboards[king_p];
     if (!kb) return false;
-    return is_square_attacked(board, __builtin_ctzll(kb), board.side_to_move ^ 1);
+    return is_square_attacked(board, std::countr_zero(kb), board.side_to_move ^ 1);
 }
 
 bool deadline_reached(const SearchState& ss) {

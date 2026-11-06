@@ -6,6 +6,7 @@
 #include <sstream>
 #include <cctype>
 #include <cstring>
+#include <bit>
 
 Board::Board() {
     clear();
@@ -240,7 +241,7 @@ bool Board::make_move(const Move& m) {
     int king_piece = (us == WHITE) ? W_KING : B_KING;
     uint64_t k_bb = piece_bitboards[king_piece];
     if (k_bb) {
-        int king_sq = __builtin_ctzll(k_bb);
+        int king_sq = std::countr_zero(k_bb);
         if (is_square_attacked(*this, king_sq, them)) {
             unmake_move(m);
             return false;

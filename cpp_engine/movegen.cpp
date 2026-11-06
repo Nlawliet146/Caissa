@@ -1,4 +1,5 @@
 #include "movegen.hpp"
+#include <bit>
 
 static uint64_t KnightAttacks[64];
 static uint64_t KingAttacks[64];
@@ -127,7 +128,7 @@ void generate_pseudo_legal_moves(const Board &board,
         uint64_t bb = board.piece_bitboards[piece];
         while (bb)
         {
-            int sq = __builtin_ctzll(bb);
+            int sq = std::countr_zero(bb);
             bb &= bb - 1;
 
             if (piece == W_PAWN || piece == B_PAWN)
@@ -212,7 +213,7 @@ void generate_pseudo_legal_moves(const Board &board,
                 attacks &= ~own_occ;
                 while (attacks)
                 {
-                    int t = __builtin_ctzll(attacks);
+                    int t = std::countr_zero(attacks);
                     attacks &= attacks - 1;
                     uint8_t flag = (opp_occ & (1ULL << t)) ? 1 : 0;
                     move_list.push_back(
@@ -273,7 +274,7 @@ void generate_pseudo_legal_moves(const Board &board,
                 attacks &= ~own_occ;
                 while (attacks)
                 {
-                    int t = __builtin_ctzll(attacks);
+                    int t = std::countr_zero(attacks);
                     attacks &= attacks - 1;
                     uint8_t flag = (opp_occ & (1ULL << t)) ? 1 : 0;
                     move_list.push_back(

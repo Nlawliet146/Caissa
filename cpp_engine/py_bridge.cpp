@@ -3,8 +3,7 @@
 #include <pybind11/stl.h>
 #include <iostream>
 #include <cstdlib>
-#include <unistd.h>
-#include <limits.h>
+#include <filesystem>
 
 namespace py = pybind11;
 
@@ -12,60 +11,55 @@ static py::scoped_interpreter* guard = nullptr;
 static py::gil_scoped_release* gil_release = nullptr;
 static py::object inference_func;
 
-static bool is_project_root(const std::string& dir) {
-    return access((dir + "/python_ml/inference_pipeline.py").c_str(), R_OK) == 0;
+namespace fs = std::filesystem;
+
+static bool is_project_root(const fs::path& dir) {
+    std::error_code error;
+    return fs::is_regular_file(dir / "python_ml" / "inference_pipeline.py", error);
 }
 
-// Find the directory that contains python_ml/. We must NOT depend on the
-// working directory: cutechess (and most GUIs) start engines from wherever
-// they like, and then "import inference_pipeline" fails and ML silently turns
-// off. So: 1) $CAISSA_ROOT, 2) walk up from the binary, 3) walk up from cwd.
-static std::string get_project_root() {
+static fs::path find_project_root(fs::path dir) {
+    while (!dir.empty()) {
+        if (is_project_root(dir)) return dir;
+        if (dir == dir.root_path()) break;
+        dir = dir.parent_path();
+    }
+    return {};
+}
+
+static fs::path get_project_root() {
     if (const char* env = std::getenv("CAISSA_ROOT")) {
         if (is_project_root(env)) return env;
     }
 
-    auto walk_up = [](std::string dir) -> std::string {
-        for (int i = 0; i < 6 && !dir.empty(); ++i) {
-            if (is_project_root(dir)) return dir;
-            const size_t slash = dir.rfind('/');
-            if (slash == std::string::npos || slash == 0) break;
-            dir.erase(slash);
-        }
-        return "";
-    };
-
-    char exe[PATH_MAX];
-    const ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
-    if (n > 0) {
-        exe[n] = '\0';
-        std::string dir(exe);
-        dir.erase(dir.rfind('/')); // strip the file name: .../build/caissa -> .../build
-        const std::string r = walk_up(dir);
-        if (!r.empty()) return r;
+    // Linux can also find a checkout after it has been moved.
+    std::error_code error;
+#ifdef __linux__
+    const auto executable = fs::read_symlink("/proc/self/exe", error);
+    if (!error) {
+        const auto root = find_project_root(executable.parent_path());
+        if (!root.empty()) return root;
     }
+#endif
+    if (is_project_root(CAISSA_SOURCE_DIR)) return CAISSA_SOURCE_DIR;
 
-    char cwd[PATH_MAX];
-    if (getcwd(cwd, sizeof(cwd)) != nullptr) {
-        const std::string r = walk_up(cwd);
-        if (!r.empty()) return r;
-    }
-    return ".";
+    const auto root = find_project_root(fs::current_path(error));
+    return root.empty() ? fs::path(".") : root;
 }
 
 PythonBridge::PythonBridge() {
-    // If PYTHONUNBUFFERED is set (Docker, CI, many IDE setups do this), Py_Initialize()
-    // calls setvbuf(stdin, _IONBF) - and glibc then DISCARDS whatever UCI lines
-    // std::cin had already buffered (e.g. a "position" + "go" the GUI sent
-    // back-to-back). Python must not touch our stdio, so remove the variable first.
-    unsetenv("PYTHONUNBUFFERED");
-
     try {
-        if (!guard) guard = new py::scoped_interpreter{};
+        if (!guard) {
+            PyConfig config;
+            PyConfig_InitPythonConfig(&config);
+            // Leave the UCI streams alone even when PYTHONUNBUFFERED is set.
+            config.configure_c_stdio = 0;
+            guard = new py::scoped_interpreter(&config);
+        }
         py::module_ sys = py::module_::import("sys");
 
-        const std::string ml_path = get_project_root() + "/python_ml";
-        sys.attr("path").attr("append")(ml_path);
+        const auto ml_path = (get_project_root() / "python_ml").u8string();
+        sys.attr("path").attr("insert")(0, py::str(reinterpret_cast<const char*>(ml_path.data()), ml_path.size()));
 
         py::module_ pipeline = py::module_::import("inference_pipeline");
         inference_func = pipeline.attr("get_search_priors");
