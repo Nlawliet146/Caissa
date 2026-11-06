@@ -64,4 +64,7 @@ public:
     void unmake_move(const Move& m);
 };
 
+// Long-algebraic UCI notation: "e2e4", "e7e8q". Returns "0000" for a null move.
+std::string move_to_uci(const Move& m);
+
 #endif

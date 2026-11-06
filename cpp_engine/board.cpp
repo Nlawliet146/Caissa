@@ -114,6 +114,23 @@ std::string Board::to_fen() const {
     return fen;
 }
 
+std::string move_to_uci(const Move& m) {
+    if (m.from_sq >= 64 || m.to_sq >= 64) return "0000";
+    std::string s;
+    s += static_cast<char>('a' + m.from_sq % 8);
+    s += static_cast<char>('1' + m.from_sq / 8);
+    s += static_cast<char>('a' + m.to_sq % 8);
+    s += static_cast<char>('1' + m.to_sq / 8);
+    switch (m.promoted_piece) {
+        case W_QUEEN:  case B_QUEEN:  s += 'q'; break;
+        case W_ROOK:   case B_ROOK:   s += 'r'; break;
+        case W_BISHOP: case B_BISHOP: s += 'b'; break;
+        case W_KNIGHT: case B_KNIGHT: s += 'n'; break;
+        default: break; // EMPTY: not a promotion
+    }
+    return s;
+}
+
 bool Board::make_move(const Move& m) {
     UndoState state;
     state.castling_rights = castling_rights;

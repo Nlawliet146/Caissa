@@ -14,6 +14,7 @@ endif()
 # Locate Python and Pybind11 on the system
 find_package(Python3 COMPONENTS Interpreter Development REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
+find_package(Threads REQUIRED) # the search runs on its own std::thread
 
 add_executable(caissa
     cpp_engine/main.cpp
@@ -27,4 +28,4 @@ add_executable(caissa
 )
 
 # Link the Pybind11 embed library to the executable
-target_link_libraries(caissa PRIVATE pybind11::embed)
+target_link_libraries(caissa PRIVATE pybind11::embed Threads::Threads)

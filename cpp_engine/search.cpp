@@ -3,21 +3,76 @@
 #include "evaluate.hpp"
 #include "tt.hpp"
 #include "py_bridge.hpp"
+#include "uci.hpp"
 #include <algorithm>
-#include <iostream>
+#include <chrono>
+#include <string>
+#include <thread>
+#include <vector>
 
-// Global flags for UCI communication
-extern std::atomic<bool> stop_search;
-extern bool use_ml;
+// ---------------------------------------------------------------------------
+// Shared flags (declared extern in search.hpp)
+// ---------------------------------------------------------------------------
+std::atomic<bool> stop_search{false};
+std::atomic<bool> use_ml{true};
+std::atomic<int>  move_overhead_ms{30};
 
-// Helper to convert your Move struct to UCI string format (e.g., e2e4)
-// Implement this based on how your engine stores squares (e.g., using an array of square names)
-std::string move_to_uci(const Move& move) {
-    // Example: return square_to_string(move.from_sq) + square_to_string(move.to_sq);
-    return "e2e4"; // REPLACE WITH YOUR ACTUAL MOVE-TO-STRING LOGIC
+namespace {
+
+constexpr int MAX_DEPTH = 64;
+
+// Everything one search needs to carry down the tree besides the board.
+struct SearchState {
+    TimePoint start{};
+    int64_t   hard_ms = 0;   // 0 = no hard limit
+    uint64_t  nodes   = 0;   // alpha_beta + quiescence nodes
+};
+
+// Counts one node and decides whether the search must unwind.
+// The clock is read only every 2048 nodes (a clock read costs ~20-30 ns,
+// a node ~0.5-1 us); the stop flag is read every node (a plain load).
+inline bool must_stop(SearchState& ss) {
+    ss.nodes++;
+    if ((ss.nodes & 2047) == 0 && ss.hard_ms > 0 && elapsed_ms(ss.start) >= ss.hard_ms)
+        stop_search.store(true);
+    return stop_search.load();
 }
 
-int quiescence(Board& board, int alpha, int beta) {
+} // namespace
+
+// ---------------------------------------------------------------------------
+// Time management
+// ---------------------------------------------------------------------------
+TimeBudget compute_time_budget(const SearchLimits& lim, int side) {
+    TimeBudget tb;
+    const int64_t overhead = lim.overhead_ms;
+
+    if (lim.infinite) return tb;                       // only "stop" ends it
+
+    if (lim.movetime > 0) {                            // exact time per move
+        tb.hard_ms = std::max<int64_t>(1, lim.movetime - overhead);
+        return tb;                                     // soft stays 0: use all of it
+    }
+
+    const int64_t T   = (side == WHITE) ? lim.wtime : lim.btime;
+    const int64_t inc = (side == WHITE) ? lim.winc  : lim.binc;
+    if (T < 0) return tb;                              // depth-only / no clock given
+
+    const int64_t mtg   = (lim.movestogo > 0) ? std::min(lim.movestogo, 50) : 30;
+    const int64_t avail = std::max<int64_t>(1, T - overhead);   // never plan to spend the last `overhead` ms
+    tb.soft_ms = std::max<int64_t>(1, std::min(avail, T / mtg + inc * 3 / 4));
+    tb.hard_ms = std::min(avail, tb.soft_ms * 3);
+    return tb;
+}
+
+// ---------------------------------------------------------------------------
+// Search
+// ---------------------------------------------------------------------------
+namespace {
+
+int quiescence(Board& board, int alpha, int beta, SearchState& ss) {
+    if (must_stop(ss)) return 0;
+
     int stand_pat = evaluate(board);
     if (stand_pat >= beta) return beta;
     if (alpha < stand_pat) alpha = stand_pat;
@@ -28,8 +83,9 @@ int quiescence(Board& board, int alpha, int beta) {
     for (const auto& move : move_list) {
         if (move.flags != 1) continue; // Tactical Captures only
         if (!board.make_move(move)) continue;
-        int score = -quiescence(board, -beta, -alpha);
+        int score = -quiescence(board, -beta, -alpha, ss);
         board.unmake_move(move);
+        if (stop_search.load()) return 0;
 
         if (score >= beta) return beta;
         if (score > alpha) alpha = score;
@@ -49,25 +105,20 @@ void score_moves(const Board& board, std::vector<Move>& move_list, const Move& t
             if (!ml_priors.empty() && idx < ml_priors.size()) {
                 move.score = (int)(ml_priors[idx] * 1000.0f);
             } else {
-                move.score = 0; 
+                move.score = 0;
             }
         }
     }
-    std::sort(move_list.begin(), move_list.end(), [](const Move& a, const Move& b) {
+    // stable_sort: equal scores keep move-generation order, so "ML off" is
+    // deterministic and the ONLY difference between ML on/off is the priors.
+    std::stable_sort(move_list.begin(), move_list.end(), [](const Move& a, const Move& b) {
         return a.score > b.score;
     });
 }
 
-// Notice the updated signature passing the time variables down the tree
-int alpha_beta(Board& board, int depth, int alpha, int beta, const std::vector<float>& ml_priors, TimePoint start_time, int allocated_time, uint64_t& nodes) {
-    // 1. Time Management Check: Do not poll time every node to save NPS
-    nodes++;
-    if ((nodes & 2047) == 0) {
-        if (allocated_time > 0 && elapsed_ms(start_time) >= allocated_time) {
-            stop_search = true;
-        }
-    }
-    if (stop_search) return 0; // Safe unwind
+int alpha_beta(Board& board, int depth, int alpha, int beta,
+               const std::vector<float>& ml_priors, SearchState& ss) {
+    if (must_stop(ss)) return 0; // Safe unwind
 
     int original_alpha = alpha;
     uint64_t hash = generate_hash(board);
@@ -78,7 +129,7 @@ int alpha_beta(Board& board, int depth, int alpha, int beta, const std::vector<f
         return cached_score;
     }
 
-    if (depth <= 0) return quiescence(board, alpha, beta);
+    if (depth <= 0) return quiescence(board, alpha, beta, ss);
 
     std::vector<Move> move_list;
     generate_pseudo_legal_moves(board, move_list);
@@ -92,13 +143,19 @@ int alpha_beta(Board& board, int depth, int alpha, int beta, const std::vector<f
         legal_moves++;
 
         // Decrease depth and recursively call. Pass empty priors inside tree.
-        static std::vector<float> empty_priors;
-        int score = -alpha_beta(board, depth - 1, -beta, -alpha, empty_priors, start_time, allocated_time, nodes);
+        static const std::vector<float> empty_priors;
+        int score = -alpha_beta(board, depth - 1, -beta, -alpha, empty_priors, ss);
         board.unmake_move(move);
+
+        // A child that was told to stop returns a dummy 0. That 0 is NOT a
+        // score: if we used it we could raise alpha, cause a fake cutoff and,
+        // worst of all, write the lie into the transposition table, where it
+        // would poison every later search. So: unwind WITHOUT touching the TT.
+        if (stop_search.load()) return 0;
 
         if (score >= beta) {
             tt_store(hash, depth, beta, HASH_BETA, move);
-            return beta; 
+            return beta;
         }
         if (score > alpha) {
             alpha = score;
@@ -111,7 +168,7 @@ int alpha_beta(Board& board, int depth, int alpha, int beta, const std::vector<f
         int king_p = (board.side_to_move == 0) ? W_KING : B_KING;
         int king_sq = __builtin_ctzll(board.piece_bitboards[king_p]);
         if (is_square_attacked(board, king_sq, ~board.side_to_move & 1))
-            return -40000 + depth; // Checkmate
+            return -40000 + depth; // Checkmate  (Phase 2: audit this line)
         return 0; // Stalemate
     }
 
@@ -120,63 +177,78 @@ int alpha_beta(Board& board, int depth, int alpha, int beta, const std::vector<f
     return alpha;
 }
 
-// This function replaces your previous 'search_root' function
-void iterative_deepening(Board& board, SearchLimits limits) {
-    TimePoint start_time = get_time();
-    int allocated_time = -1;
+} // namespace
 
-    // Allocate time dynamically based on UCI limits
-    if (limits.movetime > 0) {
-        allocated_time = limits.movetime - 50;
-    } 
-    else if (board.side_to_move == 0 && limits.wtime > 0) {
-        allocated_time = (limits.wtime / 20) + (limits.winc / 2);
-    } 
-    else if (board.side_to_move == 1 && limits.btime > 0) {
-        allocated_time = (limits.btime / 20) + (limits.binc / 2);
+// ---------------------------------------------------------------------------
+// Iterative deepening driver (runs on the search thread)
+// ---------------------------------------------------------------------------
+void iterative_deepening(Board board, SearchLimits limits) {
+    SearchState ss;
+    ss.start = limits.start;
+    const TimeBudget budget = compute_time_budget(limits, board.side_to_move);
+    ss.hard_ms = budget.hard_ms;
+
+    // 1. Legal root moves. generate_pseudo_legal_moves() may contain moves that
+    //    leave our king in check; make_move() tells us (and undoes itself).
+    //    Using the pseudo-legal list here would print an ILLEGAL "bestmove" in
+    //    checkmate/stalemate instead of "bestmove 0000".
+    std::vector<Move> root_moves;
+    {
+        std::vector<Move> pseudo;
+        generate_pseudo_legal_moves(board, pseudo);
+        for (const Move& m : pseudo) {
+            if (!board.make_move(m)) continue;
+            board.unmake_move(m);
+            root_moves.push_back(m);
+        }
     }
-
-    int max_depth = (limits.depth > 0) ? limits.depth : 100;
-    uint64_t nodes = 0;
-
-    // Ask Python ONCE for the root position, strictly if use_ml is enabled by the GUI
-    std::vector<float> priors;
-    if (use_ml) {
-        priors = PythonBridge::get_instance().get_priors(board.to_fen());
-    }
-
-    std::vector<Move> move_list;
-    generate_pseudo_legal_moves(board, move_list);
-    
-    if (move_list.empty()) {
-        std::cout << "bestmove 0000" << std::endl;
+    if (root_moves.empty()) {
+        uci_print("bestmove 0000");
         return;
     }
 
+    // 2. ML priors: ONE Python call at the root, only if enabled for this "go".
+    //    The time spent here is charged to the move clock (ss.start is the
+    //    moment "go" arrived), so ML-vs-no-ML at equal time is an honest test.
+    std::vector<float> priors;
+    if (limits.use_ml) {
+        const TimePoint t0 = get_time();
+        priors = PythonBridge::get_instance().get_priors(board.to_fen());
+        const auto nonzero = std::count_if(priors.begin(), priors.end(), [](float p) { return p > 0.0f; });
+        if (nonzero == 0) {
+            // Never let "ML on" silently degrade into "ML off": say so.
+            uci_print("info string ML requested but NO priors available (bridge/weights failed) - searching without ML");
+        } else {
+            uci_print("info string ML priors ok: " + std::to_string(nonzero) + " moves, " +
+                      std::to_string(elapsed_ms(t0)) + " ms");
+        }
+    } else {
+        uci_print("info string ML off");
+    }
+
     Move empty_tt = {NO_SQ, NO_SQ, EMPTY, 0, 0};
-    score_moves(board, move_list, empty_tt, priors);
+    score_moves(board, root_moves, empty_tt, priors);
 
     static const std::vector<float> no_priors;
-    Move best_move_overall = move_list[0];
+    Move best_move_overall = root_moves[0]; // a legal fallback if "stop" arrives instantly
     int best_score_overall = 0;
+    const int max_depth = (limits.depth > 0) ? std::min(limits.depth, MAX_DEPTH) : MAX_DEPTH;
 
     for (int d = 1; d <= max_depth; d++) {
-        if (stop_search) break;
+        if (stop_search.load()) break;
 
         int alpha = -50000;
-        int beta = 50000;
-        bool found = false;
+        const int beta = 50000;
+        bool found = false;          // at least one root move FINISHED this iteration
         Move iter_best = best_move_overall;
 
-        for (const auto& move : move_list) {
+        for (const auto& move : root_moves) {
             if (!board.make_move(move)) continue;
-            
-            // Execute depth-first search
-            int score = -alpha_beta(board, d - 1, -beta, -alpha, no_priors, start_time, allocated_time, nodes);
+            int score = -alpha_beta(board, d - 1, -beta, -alpha, no_priors, ss);
             board.unmake_move(move);
 
-            // Abort instantly if time ran out mid-branch to avoid polluting the score
-            if (stop_search) break;
+            // Aborted mid-branch: this score is a dummy, discard it.
+            if (stop_search.load()) break;
 
             if (!found || score > alpha) {
                 found = true;
@@ -185,35 +257,50 @@ void iterative_deepening(Board& board, SearchLimits limits) {
             }
         }
 
-        if (stop_search) break;
-        if (!found) break;
+        // Moves that completed before an abort carry exact scores under the
+        // full window, and the previous best move is searched first, so the
+        // best of them is never worse than the previous iteration's choice.
+        // Keeping it is sound; throwing away a half-done iteration is not
+        // needed.
+        if (found) {
+            best_move_overall = iter_best;
+            best_score_overall = alpha;
+        }
+        if (stop_search.load()) break;   // incomplete iteration: no info line
 
-        best_score_overall = alpha;
-        best_move_overall = iter_best;
+        const int64_t t = elapsed_ms(ss.start);
+        const uint64_t nps = (t > 0) ? ss.nodes * 1000 / static_cast<uint64_t>(t) : 0;
+        uci_print("info depth " + std::to_string(d) +
+                  " score cp " + std::to_string(best_score_overall) +
+                  " nodes " + std::to_string(ss.nodes) +
+                  " nps " + std::to_string(nps) +
+                  " time " + std::to_string(t) +
+                  " pv " + move_to_uci(best_move_overall));
 
-        int time_used = elapsed_ms(start_time);
-        
-        // Output standardized UCI info
-        std::cout << "info depth " << d
-                  << " score cp " << best_score_overall
-                  << " nodes " << nodes
-                  << " time " << time_used
-                  << std::endl;
-
-        // Next iteration: Try the best move found so far FIRST
-        for (auto it = move_list.begin(); it != move_list.end(); ++it) {
-            if (it->from_sq == best_move_overall.from_sq && 
+        // Next iteration: try the best move found so far FIRST
+        for (auto it = root_moves.begin(); it != root_moves.end(); ++it) {
+            if (it->from_sq == best_move_overall.from_sq &&
                 it->to_sq == best_move_overall.to_sq &&
                 it->promoted_piece == best_move_overall.promoted_piece) {
-                std::rotate(move_list.begin(), it, it + 1);
+                std::rotate(root_moves.begin(), it, it + 1);
                 break;
             }
         }
 
-        if (allocated_time > 0 && time_used >= allocated_time) {
-            break;
-        }
+        // Soft limit. If iteration times grow by a factor b per depth, then after
+        // finishing depth d (elapsed E) depth d+1 ends at about b*E. We start it
+        // only while E < soft/2, so it still finishes before the hard limit
+        // (3*soft) whenever b <= 3*soft / (soft/2) = 6. Measured b on this engine
+        // is 3.6-6.8, so a few iterations are cut off by the hard limit; the
+        // partial-iteration salvage above makes that cheap.
+        if (budget.soft_ms > 0 && t * 2 >= budget.soft_ms) break;
     }
 
-    std::cout << "bestmove " << move_to_uci(best_move_overall) << std::endl;
+    // UCI: after "go infinite" the engine must NOT answer until "stop" arrives,
+    // even if the search ran out of depth/moves.
+    if (limits.infinite) {
+        while (!stop_search.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
+    }
+
+    uci_print("bestmove " + move_to_uci(best_move_overall));
 }
