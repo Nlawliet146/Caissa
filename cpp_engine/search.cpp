@@ -6,6 +6,7 @@
 #include "uci.hpp"
 #include <algorithm>
 #include <chrono>
+#include <cstdlib>
 #include <string>
 #include <thread>
 #include <vector>
@@ -20,13 +21,34 @@ std::atomic<int>  move_overhead_ms{30};
 namespace {
 
 constexpr int MAX_DEPTH = 64;
+// MATE_SCORE / MATE_BOUND / MAX_PLY live in tt.hpp
 
 // Everything one search needs to carry down the tree besides the board.
 struct SearchState {
     TimePoint start{};
     int64_t   hard_ms = 0;   // 0 = no hard limit
     uint64_t  nodes   = 0;   // alpha_beta + quiescence nodes
+    size_t    root_hist = 0; // board.history.size() at the root (repetition scope)
 };
+
+// True if side to move has at least one legal move.
+bool has_legal_move(Board& board) {
+    std::vector<Move> ml;
+    generate_pseudo_legal_moves(board, ml);
+    for (const Move& m : ml) {
+        if (!board.make_move(m)) continue;
+        board.unmake_move(m);
+        return true;
+    }
+    return false;
+}
+
+bool in_check(const Board& board) {
+    const int king_p = (board.side_to_move == WHITE) ? W_KING : B_KING;
+    const uint64_t kb = board.piece_bitboards[king_p];
+    if (!kb) return false;
+    return is_square_attacked(board, __builtin_ctzll(kb), board.side_to_move ^ 1);
+}
 
 // Counts one node and decides whether the search must unwind.
 // The clock is read only every 2048 nodes (a clock read costs ~20-30 ns,
@@ -116,16 +138,26 @@ void score_moves(const Board& board, std::vector<Move>& move_list, const Move& t
     });
 }
 
-int alpha_beta(Board& board, int depth, int alpha, int beta,
+int alpha_beta(Board& board, int depth, int alpha, int beta, int ply,
                const std::vector<float>& ml_priors, SearchState& ss) {
     if (must_stop(ss)) return 0; // Safe unwind
 
+    // Draw detection (path-dependent: must precede the TT probe).
+    if (ply > 0) {
+        if (board.is_repetition(ss.root_hist)) return 0;
+        if (board.is_fifty_move_draw()) {
+            // Checkmate on the 100th half-move still beats the draw.
+            if (!in_check(board) || has_legal_move(board)) return 0;
+            return -MATE_SCORE + ply;
+        }
+    }
+
     int original_alpha = alpha;
-    uint64_t hash = generate_hash(board);
+    const uint64_t hash = board.hash;
     Move tt_move = {NO_SQ, NO_SQ, EMPTY, 0, 0};
     int cached_score;
 
-    if (tt_probe(hash, depth, alpha, beta, cached_score, tt_move)) {
+    if (tt_probe(hash, depth, alpha, beta, cached_score, tt_move, ply)) {
         return cached_score;
     }
 
@@ -144,7 +176,7 @@ int alpha_beta(Board& board, int depth, int alpha, int beta,
 
         // Decrease depth and recursively call. Pass empty priors inside tree.
         static const std::vector<float> empty_priors;
-        int score = -alpha_beta(board, depth - 1, -beta, -alpha, empty_priors, ss);
+        int score = -alpha_beta(board, depth - 1, -beta, -alpha, ply + 1, empty_priors, ss);
         board.unmake_move(move);
 
         // A child that was told to stop returns a dummy 0. That 0 is NOT a
@@ -154,7 +186,7 @@ int alpha_beta(Board& board, int depth, int alpha, int beta,
         if (stop_search.load()) return 0;
 
         if (score >= beta) {
-            tt_store(hash, depth, beta, HASH_BETA, move);
+            tt_store(hash, depth, beta, HASH_BETA, move, ply);
             return beta;
         }
         if (score > alpha) {
@@ -165,15 +197,13 @@ int alpha_beta(Board& board, int depth, int alpha, int beta,
 
     if (legal_moves == 0) {
         // Ensure your WHITE / BLACK constants match your implementation
-        int king_p = (board.side_to_move == 0) ? W_KING : B_KING;
-        int king_sq = __builtin_ctzll(board.piece_bitboards[king_p]);
-        if (is_square_attacked(board, king_sq, ~board.side_to_move & 1))
-            return -40000 + depth; // Checkmate  (Phase 2: audit this line)
+        if (in_check(board))
+            return -MATE_SCORE + ply; // Checkmate: nearer mates score lower for the mated side
         return 0; // Stalemate
     }
 
     int flag = (alpha <= original_alpha) ? HASH_ALPHA : HASH_EXACT;
-    tt_store(hash, depth, alpha, flag, best_move);
+    tt_store(hash, depth, alpha, flag, best_move, ply);
     return alpha;
 }
 
@@ -187,6 +217,7 @@ void iterative_deepening(Board board, SearchLimits limits) {
     ss.start = limits.start;
     const TimeBudget budget = compute_time_budget(limits, board.side_to_move);
     ss.hard_ms = budget.hard_ms;
+    ss.root_hist = board.history.size();
 
     // 1. Legal root moves. generate_pseudo_legal_moves() may contain moves that
     //    leave our king in check; make_move() tells us (and undoes itself).
@@ -244,7 +275,7 @@ void iterative_deepening(Board board, SearchLimits limits) {
 
         for (const auto& move : root_moves) {
             if (!board.make_move(move)) continue;
-            int score = -alpha_beta(board, d - 1, -beta, -alpha, no_priors, ss);
+            int score = -alpha_beta(board, d - 1, -beta, -alpha, 1, no_priors, ss);
             board.unmake_move(move);
 
             // Aborted mid-branch: this score is a dummy, discard it.
@@ -270,8 +301,16 @@ void iterative_deepening(Board board, SearchLimits limits) {
 
         const int64_t t = elapsed_ms(ss.start);
         const uint64_t nps = (t > 0) ? ss.nodes * 1000 / static_cast<uint64_t>(t) : 0;
+        std::string score_str;
+        if (std::abs(best_score_overall) >= MATE_BOUND) {
+            const int plies = MATE_SCORE - std::abs(best_score_overall);
+            const int moves = (plies + 1) / 2;
+            score_str = "mate " + std::to_string(best_score_overall > 0 ? moves : -moves);
+        } else {
+            score_str = "cp " + std::to_string(best_score_overall);
+        }
         uci_print("info depth " + std::to_string(d) +
-                  " score cp " + std::to_string(best_score_overall) +
+                  " score " + score_str +
                   " nodes " + std::to_string(ss.nodes) +
                   " nps " + std::to_string(nps) +
                   " time " + std::to_string(t) +

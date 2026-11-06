@@ -1,5 +1,8 @@
 #include "board.hpp"
 #include "movegen.hpp"
+#include "tt.hpp"
+#include <cstdlib>
+#include <algorithm>
 #include <sstream>
 #include <cctype>
 #include <cstring>
@@ -17,6 +20,7 @@ void Board::clear() {
     en_passant_sq = NO_SQ;
     halfmove_clock = 0;
     fullmove_number = 1;
+    hash = 0;
     history.clear();
 }
 
@@ -24,7 +28,13 @@ void Board::parse_fen(const std::string& fen) {
     clear();
     std::istringstream ss(fen);
     std::string pos, color, castling, ep;
+    int hm = 0, fm = 1;
     ss >> pos >> color >> castling >> ep;
+    if (!(ss >> hm)) hm = 0;
+    if (!(ss >> fm)) fm = 1;
+    if (ep.empty()) ep = "-";
+    halfmove_clock = hm;
+    fullmove_number = fm < 1 ? 1 : fm;
 
     int rank = 7, file = 0;
     for (char c : pos) {
@@ -73,6 +83,8 @@ void Board::parse_fen(const std::string& fen) {
         int r = ep[1] - '1';
         en_passant_sq = r * 8 + f;
     }
+
+    hash = generate_hash(*this);
 }
 
 std::string Board::to_fen() const {
@@ -110,7 +122,7 @@ std::string Board::to_fen() const {
         fen += " -";
     }
 
-    fen += " 0 1";
+    fen += " " + std::to_string(halfmove_clock) + " " + std::to_string(fullmove_number);
     return fen;
 }
 
@@ -137,11 +149,22 @@ bool Board::make_move(const Move& m) {
     state.en_passant_sq = en_passant_sq;
     state.halfmove_clock = halfmove_clock;
     state.captured_piece = square_board[m.to_sq];
+    state.hash = hash;
     history.push_back(state);
 
     int moving_piece = square_board[m.from_sq];
     int us = side_to_move;
     int them = ~us & 1;
+
+    const bool is_pawn_move = (moving_piece == W_PAWN || moving_piece == B_PAWN);
+    const bool is_capture = (m.flags == 1 && state.captured_piece != EMPTY) || m.flags == 2;
+    halfmove_clock = (is_pawn_move || is_capture) ? 0 : halfmove_clock + 1;
+    if (us == BLACK) fullmove_number++;
+
+    // Zobrist: strip old castling/ep state; moving piece leaves its square
+    hash ^= ZobristCastle[castling_rights];
+    if (en_passant_sq != NO_SQ) hash ^= ZobristEP[en_passant_sq & 7];
+    hash ^= ZobristPieces[moving_piece][m.from_sq];
 
     // Remove moving piece from source square
     piece_bitboards[moving_piece] &= ~(1ULL << m.from_sq);
@@ -152,12 +175,14 @@ bool Board::make_move(const Move& m) {
     if (m.flags == 1 && state.captured_piece != EMPTY) {
         piece_bitboards[state.captured_piece] &= ~(1ULL << m.to_sq);
         color_bitboards[them] &= ~(1ULL << m.to_sq);
+        hash ^= ZobristPieces[state.captured_piece][m.to_sq];
     } else if (m.flags == 2) { // En Passant capture
         int ep_cap_sq = (us == WHITE) ? m.to_sq - 8 : m.to_sq + 8;
         int ep_piece = (us == WHITE) ? B_PAWN : W_PAWN;
         piece_bitboards[ep_piece] &= ~(1ULL << ep_cap_sq);
         color_bitboards[them] &= ~(1ULL << ep_cap_sq);
         square_board[ep_cap_sq] = EMPTY;
+        hash ^= ZobristPieces[ep_piece][ep_cap_sq];
     }
 
     // Handle Promotions
@@ -170,6 +195,7 @@ bool Board::make_move(const Move& m) {
     piece_bitboards[dest_piece] |= (1ULL << m.to_sq);
     color_bitboards[us] |= (1ULL << m.to_sq);
     square_board[m.to_sq] = dest_piece;
+    hash ^= ZobristPieces[dest_piece][m.to_sq];
 
     // Handle Castling rook move
     if (m.flags == 3) {
@@ -186,11 +212,13 @@ bool Board::make_move(const Move& m) {
         piece_bitboards[r_piece] |= (1ULL << r_to);
         color_bitboards[us] |= (1ULL << r_to);
         square_board[r_to] = r_piece;
+        hash ^= ZobristPieces[r_piece][r_from] ^ ZobristPieces[r_piece][r_to];
     }
 
     // Update En Passant Target
     if ((moving_piece == W_PAWN || moving_piece == B_PAWN) && std::abs(m.to_sq - m.from_sq) == 16) {
         en_passant_sq = (us == WHITE) ? m.from_sq + 8 : m.from_sq - 8;
+        hash ^= ZobristEP[en_passant_sq & 7];
     } else {
         en_passant_sq = NO_SQ;
     }
@@ -202,6 +230,8 @@ bool Board::make_move(const Move& m) {
     if (m.from_sq == A1 || m.to_sq == A1) castling_rights &= ~WQ;
     if (m.from_sq == H8 || m.to_sq == H8) castling_rights &= ~BK;
     if (m.from_sq == A8 || m.to_sq == A8) castling_rights &= ~BQ;
+    hash ^= ZobristCastle[castling_rights];
+    hash ^= ZobristSide;
 
     color_bitboards[BOTH] = color_bitboards[WHITE] | color_bitboards[BLACK];
     side_to_move = them;
@@ -227,6 +257,7 @@ void Board::unmake_move(const Move& m) {
     side_to_move = ~side_to_move & 1;
     int us = side_to_move;
     int them = ~us & 1;
+    if (us == BLACK) fullmove_number--;
 
     int moved_piece = square_board[m.to_sq];
     if (m.promoted_piece != EMPTY) moved_piece = (us == WHITE) ? W_PAWN : B_PAWN;
@@ -274,5 +305,20 @@ void Board::unmake_move(const Move& m) {
     castling_rights = state.castling_rights;
     en_passant_sq = state.en_passant_sq;
     halfmove_clock = state.halfmove_clock;
+    hash = state.hash;
     color_bitboards[BOTH] = color_bitboards[WHITE] | color_bitboards[BLACK];
+}
+
+bool Board::is_repetition(size_t root_hist) const {
+    const size_t n = history.size();
+    const size_t lim = std::min<size_t>(static_cast<size_t>(halfmove_clock), n);
+    int reps = 0;
+    for (size_t k = 4; k <= lim; k += 2) {
+        const size_t idx = n - k;
+        if (history[idx].hash == hash) {
+            if (idx >= root_hist) return true;
+            if (++reps >= 2) return true;
+        }
+    }
+    return false;
 }

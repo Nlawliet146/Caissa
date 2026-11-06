@@ -38,6 +38,7 @@ struct UndoState {
     int en_passant_sq;
     int halfmove_clock;
     int captured_piece;
+    uint64_t hash; // Zobrist key of the position BEFORE the move
 };
 
 class Board {
@@ -51,6 +52,7 @@ public:
     int en_passant_sq;
     int halfmove_clock;
     int fullmove_number;
+    uint64_t hash; // incrementally maintained Zobrist key
 
     std::vector<UndoState> history;
 
@@ -62,6 +64,12 @@ public:
 
     bool make_move(const Move& m);
     void unmake_move(const Move& m);
+
+    // True if the current position is a draw by repetition: a single prior
+    // occurrence inside the search tree (history index >= root_hist), or two
+    // prior occurrences anywhere (threefold).
+    bool is_repetition(size_t root_hist) const;
+    bool is_fifty_move_draw() const { return halfmove_clock >= 100; }
 };
 
 // Long-algebraic UCI notation: "e2e4", "e7e8q". Returns "0000" for a null move.
