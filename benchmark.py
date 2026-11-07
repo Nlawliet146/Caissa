@@ -106,7 +106,7 @@ def main():
     parser.add_argument("--movetime", type=int, default=200, help="milliseconds")
     parser.add_argument("--repeats", type=int, default=3)
     parser.add_argument("--timeout", type=float, default=60)
-    parser.add_argument("--experiment", choices=("MLRootLMR", "MLPlyOne"),
+    parser.add_argument("--experiment", choices=("MLRootLMR",),
                         help="compare one experiment against root ordering with ML enabled in both")
     parser.add_argument("--json", type=Path, help="write all individual measurements")
     args = parser.parse_args()
@@ -132,8 +132,7 @@ def main():
                          and (bool(row["experiment"]) if args.experiment else row["ml"]) == use_ml]
                 label = (args.experiment or "ML on") if use_ml else ("Root ordering" if control_ml else "ML off")
                 print(f"{limit}, {label}, {len(group)} searches")
-                for field in ("depth", "nodes", "engine_ms", "wall_ms", "reductions", "researches",
-                              "ply_one_calls", "ply_one_usable", "ply_one_us"):
+                for field in ("depth", "nodes", "engine_ms", "wall_ms", "reductions", "researches"):
                     values = [row[field] for row in group if row.get(field) is not None]
                     if not values and field not in ("depth", "nodes", "engine_ms", "wall_ms"):
                         continue

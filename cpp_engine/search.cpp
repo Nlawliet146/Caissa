@@ -9,7 +9,6 @@
 #include <cstdlib>
 #include <string>
 #include <thread>
-#include <unordered_map>
 #include <vector>
 #include <bit>
 
@@ -30,10 +29,6 @@ struct SearchState {
     TimePoint start{};
     int64_t   hard_ms = 0;   // 0 = no hard limit
     uint64_t  nodes   = 0;   // alpha_beta + quiescence nodes
-    bool ml_ply_one = false;
-    std::unordered_map<uint64_t, std::vector<float>> ply_one_priors;
-    int64_t ply_one_us = 0;
-    size_t ply_one_usable = 0;
     size_t    root_hist = 0; // board.history.size() at the root (repetition scope)
 };
 
@@ -195,24 +190,7 @@ int alpha_beta(Board& board, int depth, int alpha, int beta, int ply,
     std::vector<Move> move_list;
     generate_pseudo_legal_moves(board, move_list);
     static const std::vector<float> no_priors;
-    const std::vector<float>* priors = &no_priors;
-    if (ply == 1 && ss.ml_ply_one) {
-        auto [entry, inserted] = ss.ply_one_priors.try_emplace(hash);
-        if (inserted) {
-            if (deadline_reached(ss)) {
-                ss.ply_one_priors.erase(entry);
-                return 0;
-            }
-            const auto start = get_time();
-            entry->second = PythonBridge::get_instance().get_priors(board.to_fen());
-            ss.ply_one_us += std::chrono::duration_cast<std::chrono::microseconds>(get_time() - start).count();
-            if (std::any_of(entry->second.begin(), entry->second.end(), [](float p) { return p > 0.0f; }))
-                ++ss.ply_one_usable;
-            if (deadline_reached(ss)) return 0;
-        }
-        priors = &entry->second;
-    }
-    score_moves(board, move_list, tt_move, *priors);
+    score_moves(board, move_list, tt_move, no_priors);
 
     int legal_moves = 0;
     Move best_move = {NO_SQ, NO_SQ, EMPTY, 0, 0};
@@ -307,7 +285,6 @@ void iterative_deepening(Board board, SearchLimits limits) {
     Move empty_tt = {NO_SQ, NO_SQ, EMPTY, 0, 0};
     score_moves(board, root_moves, empty_tt, priors);
 
-    ss.ml_ply_one = limits.ml_ply_one && has_priors;
     const bool root_lmr = limits.ml_root_lmr && has_priors && !in_check(board);
     const float uniform_prior = 1.0f / root_moves.size();
     size_t reductions = 0;
@@ -326,7 +303,7 @@ void iterative_deepening(Board board, SearchLimits limits) {
 
         for (size_t i = 0; i < root_moves.size(); ++i) {
             const Move& move = root_moves[i];
-            if ((root_lmr || ss.ml_ply_one) && deadline_reached(ss)) break;
+            if (root_lmr && deadline_reached(ss)) break;
             if (!board.make_move(move)) continue;
             const size_t prior_index = move.from_sq * 64 + move.to_sq;
             const bool reduce = root_lmr && d >= 4 && i >= std::max<size_t>(3, root_moves.size() / 2) &&
@@ -405,12 +382,9 @@ void iterative_deepening(Board board, SearchLimits limits) {
         while (!stop_search.load()) std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    if (limits.ml_root_lmr || limits.ml_ply_one) {
+    if (limits.ml_root_lmr) {
         uci_print("info string phase4 reductions " + std::to_string(reductions) +
-                  " researches " + std::to_string(researches) +
-                  " ply_one_calls " + std::to_string(ss.ply_one_priors.size()) +
-                  " ply_one_usable " + std::to_string(ss.ply_one_usable) +
-                  " ply_one_us " + std::to_string(ss.ply_one_us));
+                  " researches " + std::to_string(researches));
     }
     uci_print("bestmove " + move_to_uci(best_move_overall));
 }

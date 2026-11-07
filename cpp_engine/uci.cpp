@@ -20,7 +20,6 @@ const char* const START_FEN = "rnbqkbnr/pppppppp/8/8/8/8/PPPPPPPP/RNBQKBNR w KQk
 
 std::mutex  out_mutex;     // serialises everything written to stdout
 bool ml_root_lmr = false;
-bool ml_ply_one = false;
 std::thread search_thread; // the ONE search thread (joinable => a search may be running)
 
 std::string lower(std::string s) {
@@ -105,7 +104,6 @@ void parse_go(const std::string& command, Board& board) {
     limits.start       = get_time();            // start the clock NOW, before anything slow happens
     limits.use_ml      = use_ml.load();         // snapshot (see SearchLimits)
     limits.ml_root_lmr = limits.use_ml && ml_root_lmr;
-    limits.ml_ply_one = limits.use_ml && ml_ply_one;
     limits.overhead_ms = move_overhead_ms.load();
 
     const std::vector<std::string> tok = tokenize(command);
@@ -164,8 +162,6 @@ void parse_setoption(const std::string& command) {
         use_ml = enabled;
     } else if (name == "mlrootlmr") {
         ml_root_lmr = enabled;
-    } else if (name == "mlplyone") {
-        ml_ply_one = enabled;
     } else if (name == "moveoverhead") {
         move_overhead_ms = std::clamp(std::atoi(value.c_str()), 0, 5000);
     }
@@ -201,7 +197,6 @@ void uci_loop() {
             uci_print("id author nlawliet");
             uci_print(std::string("option name UseML type check default ") + (use_ml ? "true" : "false"));
             uci_print("option name MLRootLMR type check default false");
-            uci_print("option name MLPlyOne type check default false");
             uci_print("option name MoveOverhead type spin default 30 min 0 max 5000");
             uci_print("uciok");
         }
