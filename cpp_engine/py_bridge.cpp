@@ -58,6 +58,12 @@ PythonBridge::PythonBridge() {
         }
         py::module_ sys = py::module_::import("sys");
 
+        // Use the packages from the Python environment selected by CMake,
+        // including when a GUI launches us without an activated shell.
+        sys.attr("path").attr("insert")(0, CAISSA_PYTHON_PURELIB);
+        if (std::string(CAISSA_PYTHON_PLATLIB) != CAISSA_PYTHON_PURELIB)
+            sys.attr("path").attr("insert")(0, CAISSA_PYTHON_PLATLIB);
+
         const auto ml_path = (get_project_root() / "python_ml").u8string();
         sys.attr("path").attr("insert")(0, py::str(reinterpret_cast<const char*>(ml_path.data()), ml_path.size()));
 

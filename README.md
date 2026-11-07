@@ -46,7 +46,6 @@ cmake -S . -B build -DCMAKE_BUILD_TYPE=Release \
   -DPython3_EXECUTABLE="$VIRTUAL_ENV/bin/python" \
   -Dpybind11_DIR="$(python -m pybind11 --cmakedir)"
 cmake --build build --parallel
-export PYTHONPATH="$(python -c 'import sysconfig; print(sysconfig.get_path("purelib"))')${PYTHONPATH:+:$PYTHONPATH}"
 ./build/caissa
 ```
 
@@ -59,7 +58,6 @@ $python = (Resolve-Path .\.venv\Scripts\python.exe).Path
 $pybind11 = & $python -m pybind11 --cmakedir
 cmake -S . -B build "-DPython3_EXECUTABLE=$python" "-Dpybind11_DIR=$pybind11"
 cmake --build build --config Release --parallel
-$env:PYTHONPATH = & $python -c "import sysconfig; print(sysconfig.get_path('purelib'))"
 .\build\Release\caissa.exe
 ```
 
@@ -69,9 +67,12 @@ generator such as Ninja, configure with `-DCMAKE_BUILD_TYPE=Release` and run
 
 ### Run with or without the model
 
-The shipped checkpoint loads automatically when ML is enabled. Launch a GUI
-from the same shell if you want it to inherit the Python environment. If you
-move the checkout and the engine cannot find the model code, set `CAISSA_ROOT`
+The build records the selected Python environment's package directories, so
+you can launch the compiled engine directly for later sessions, including
+from a chess GUI. Keep that environment installed. If you move or replace
+the environment, rerun the configure and build commands with its new path.
+The shipped checkpoint loads automatically when ML is enabled. If you move
+the checkout and the engine cannot find the model code, set `CAISSA_ROOT`
 to the checkout's absolute path.
 
 For a classical-only build, or if [PyTorch](https://pytorch.org/get-started/locally/)
