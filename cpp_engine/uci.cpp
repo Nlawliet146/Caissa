@@ -194,7 +194,7 @@ void uci_loop() {
 
         if (token == "uci") {
             uci_print("id name Caissa");
-            uci_print("id author nlawliet");
+            uci_print("id author Naman and Pratham");
             uci_print(std::string("option name UseML type check default ") + (use_ml ? "true" : "false"));
             uci_print("option name MLRootLMR type check default false");
             uci_print("option name MoveOverhead type spin default 30 min 0 max 5000");
